@@ -1,0 +1,147 @@
+---
+sidebar_position: 2
+title: Встроенные виды плагинов
+description: Перечень видов, нормативно зафиксированных в plugin-system-spec — tool, orchestrator. Каждому даны контракт, доступные хуки, типичные реализации.
+slug: /reference/kinds-list
+---
+
+# Встроенные виды плагинов
+
+В v1.0 spec-репозиторий нормативно фиксирует два встроенных вида плагинов. Большинство доменных видов (`llm`, `embedder`, `vector_store`, `chunker`, и т.д.) объявляются приложением-потребителем.
+
+## `tool`
+
+Function-style плагин: принимает структурированные аргументы, возвращает структурированный результат.
+
+- **Hookspec**: [`kinds/tool/v1.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/kinds/tool)
+- **`kind_api_version`**: `1.0.0`
+- **Типичный runtime**: `in_process` или `mcp_stdio`
+
+### Хуки
+
+| Hook | Dispatch | Описание |
+|---|---|---|
+| `get_schema` | `broadcast_collect` | Возвращает JSON Schema входа/выхода плагина — для inspector-UI и MCP-registration. |
+| `execute` | `singleton` | Выполнить tool с аргументами, вернуть результат. |
+
+### Типичные реализации
+
+- `semantic_search` — поиск по индексированным документам.
+- `http_fetch` — скачать страницу по URL.
+- `file_read` / `file_write` — работа с файловой системой в sandbox-каталоге.
+- `code_execute` — выполнить код в изолированной среде (обычно `mcp_stdio`).
+- `sql_query` — выполнить SQL-запрос к подключённой БД.
+
+### Минимальный манифест
+
+```toml
+[plugin]
+schema_version = "1"
+name = "my-tool"
+kind = "tool"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+entry_point = "plugin:MyTool"
+```
+
+## `orchestrator`
+
+Управляет жизненным циклом долгоживущих UoW (unit-of-work) — enqueue, status, backfill. **Singleton**, всегда `in_process_only` (не может жить через MCP из-за state).
+
+- **Hookspec**: [`kinds/orchestrator/v1.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/kinds/orchestrator)
+- **`kind_api_version`**: `1.0.0`
+- **Runtime**: только `in_process`
+
+### Хуки
+
+| Hook | Dispatch | Описание |
+|---|---|---|
+| `enqueue` | `singleton` | Поставить UoW в очередь. Идемпотентно по `idempotency_key`. Возвращает `(unit_id, deduplicated)`. |
+| `status` | `singleton` | Получить текущий статус UoW. Возвращает `(state, started_at?, finished_at?, progress?, error?)`. |
+| `backfill` | `singleton` | Повторная постановка failed/expired units в очередь. Возвращает `(enqueued_count, skipped_count)`. |
+
+### Встроенная реализация
+
+Каждый binding включает `LocalExecutorOrchestrator` — обязательный in-tree плагин. Семантика:
+
+- in-process executor: `enqueue` → запуск в той же event loop / thread pool.
+- in-memory очередь (или персистный JSON в Phase 0).
+- Реальная очередь (Postgres-based, Redis-based) — Phase 1+ через внешние orchestrator-плагины (Dagster-wrapper, Celery-wrapper).
+
+## Виды, объявляемые приложением-потребителем
+
+Приложения разных доменов используют разные наборы видов. Виды **не нормативные** — каждое приложение объявляет свои hookspecs. Ниже — несколько типичных кластеров как отправная точка.
+
+### Data-обработка
+
+| Вид | Назначение | Типичный dispatch |
+|---|---|---|
+| `source` | Источник данных (S3, Postgres, Kafka). | `broadcast_collect` (несколько источников) или `capability` (по формату) |
+| `processor` | Трансформация / обогащение записей. | `chain` (pipeline) или `broadcast_collect` |
+| `sink` | Целевое хранилище (Elasticsearch, warehouse). | `broadcast_notify` (fan-out) или `singleton` |
+
+### Уведомления и интеграции
+
+| Вид | Назначение | Типичный dispatch |
+|---|---|---|
+| `notifier` | Отправка уведомлений (email, SMS, webhook, push). | `capability` (по channel) или `broadcast_notify` (fan-out) |
+| `auth_provider` | OAuth / SAML / LDAP. | `capability` (по provider-type) |
+| `webhook_handler` | Обработка входящих webhooks. | `capability` (по event-type) |
+
+### Бизнес-логика
+
+| Вид | Назначение | Типичный dispatch |
+|---|---|---|
+| `payment_provider` | Stripe / PayPal / внутренний модуль. | `capability` (по валюте / региону) или `singleton` |
+| `tax_calculator` | Расчёт налогов по юрисдикции. | `capability` (по стране) |
+| `pricing_strategy` | Правила ценообразования. | `chain` (применяются последовательно) |
+
+### Observability / platform
+
+| Вид | Назначение | Типичный dispatch |
+|---|---|---|
+| `metric_exporter` | Выгрузка метрик (Prometheus / OTLP). | `broadcast_collect` или `broadcast_notify` |
+| `audit_logger` | Audit-trail событий. | `broadcast_notify` |
+| `event_listener` | Подписчик на lifecycle-события. | `broadcast_notify` |
+| `rate_limiter` | Лимитирование запросов. | `chain` (в middleware-слое) |
+
+### AI / RAG-платформы (один из возможных сценариев)
+
+| Вид | Назначение | Типичный dispatch |
+|---|---|---|
+| `llm` | Языковая модель — completion, chat, streaming. | `singleton` |
+| `embedder` | Векторное представление текста. | `capability` (под разные языки) или `singleton` |
+| `vector_store` | Векторное хранилище — upsert/search. | `singleton` |
+| `chunker` | Разбиение текста/кода на фрагменты. | `capability` (под разные форматы) |
+| `reranker` | Повторное ранжирование результатов поиска. | `chain` |
+| `tool_provider` | Источник инструментов для агента. | `broadcast_collect` |
+
+## Объявление собственного вида
+
+Если ни один из перечисленных не подходит, объявите собственный — см. [Виды плагинов](../concepts/kinds) и [ADR-0004](../spec/adr/0004-hookspec).
+
+Шаги:
+
+1. Написать hookspec в `kinds/<name>/v1.yaml`.
+2. Описать JSON Schema для входов/выходов каждого хука в `kinds/<name>/schemas/`.
+3. Сгенерировать типы для своей реализации (pydantic/zod/struct).
+4. Зарегистрировать hookspec при `discover()` через параметр `kind_hookspecs`.
+
+## Namespace для имён видов
+
+Рекомендуемая конвенция (не enforced):
+
+- `snake_case`.
+- Существительные в единственном числе: `embedder`, не `embedders`.
+- Без версий в имени: `llm`, не `llm_v2`. Версия — в `kind_api_version`.
+- Префикс организации для необщих: `acme_internal_scorer` — чтобы не конфликтовать с потенциальными будущими стандартными видами.
+
+## Связь с диспетчеризацией
+
+`kind` сам по себе не задаёт dispatch. Dispatch объявляется **на уровне хука** в hookspec. Один вид может иметь хуки с разными dispatch-классами (как `tool` с `broadcast_collect` для `get_schema` и `singleton` для `execute`).
+
+## См. также
+
+- [Виды плагинов](../concepts/kinds) — как объявить собственный.
+- [ADR-0004: Формализм hookspec](../spec/adr/0004-hookspec) — YAML-формат + эмиттеры.
+- [Классы диспетчеризации](../concepts/dispatch) — какой выбрать.

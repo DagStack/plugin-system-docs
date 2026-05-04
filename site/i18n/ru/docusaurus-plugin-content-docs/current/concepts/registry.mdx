@@ -1,0 +1,256 @@
+---
+sidebar_position: 1
+title: Реестр плагинов
+description: PluginRegistry — центральный объект, который хранит загруженные плагины, управляет их жизненным циклом и предоставляет доступ по kind+name.
+slug: /concepts/registry
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Реестр плагинов
+
+`PluginRegistry` — центральный объект системы. Он хранит набор загруженных плагинов, проверяет совместимость их манифестов с версией ядра, рассчитывает порядок инициализации с учётом зависимостей и предоставляет доступ к плагинам по сочетанию **вид + имя**.
+
+## Получение реестра
+
+Единственный рекомендуемый путь получить реестр — вызвать `discover(path)`. Функция рекурсивно обходит указанный каталог, находит папки с файлом `dagstack.toml`, валидирует манифесты и возвращает готовый реестр.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import PluginRegistry
+
+    registry = PluginRegistry()
+    registry.discover("plugins/")
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        return err
+    }
+
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        plugin := buildPlugin(entry.Manifest) // user-defined factory
+        if err := reg.RegisterManifest(entry.Manifest, plugin); err != nil {
+            return err
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Прямое создание реестра через конструктор `PluginRegistry(...)` в обычном коде не нужно и не рекомендуется — обход каталогов выполняет `discover`, который одновременно с обнаружением проводит валидацию.
+
+## Жизненный цикл
+
+Каждый загруженный плагин проходит через три фазы:
+
+1. **Регистрация** — `discover` читает манифест, создаёт экземпляр плагина, добавляет в реестр. На этом шаге работают только проверки манифеста и импорта.
+2. **Инициализация** — `setup_all()` вычисляет порядок инициализации через топологическую сортировку зависимостей (`topo_sort`) и вызывает `setup(context)` у каждого плагина.
+3. **Завершение** — `teardown_all()` вызывает `teardown()` в обратном порядке. Ошибки в отдельных плагинах не прерывают цикл, а собираются в `TeardownErrors`.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+
+    async def main() -> None:
+        registry = PluginRegistry()
+        registry.discover("plugins/")
+
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("app"),
+            registry=registry,
+        )
+        await registry.setup_all(ctx)
+        try:
+            ...
+        finally:
+            await registry.teardown_all()
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    ctx := context.Background()
+
+    entries, _ := pluginsystem.Discover("plugins/")
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        _ = reg.RegisterManifest(entry.Manifest, buildPlugin(entry.Manifest))
+    }
+
+    pluginCtx := &pluginsystem.PluginContext{
+        Logger:   slog.Default(),
+        Registry: reg,
+    }
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        return err
+    }
+    defer reg.TeardownAll(ctx)
+    ```
+  </TabItem>
+</Tabs>
+
+## Получение плагина
+
+Доступ к плагину — по сочетанию `kind + name`. Метод возвращает прокси-объект, который применяет правила диспетчеризации и инъекцию ресурсов.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    llm = registry.get_plugin("llm", name="openai_compatible")
+    response = llm.complete(prompt="Explain dagstack in one paragraph.")
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    p, err := reg.Resolve("openai_compatible")
+    if err != nil {
+        return err
+    }
+    llm := p.Unwrap().(LLMClient)
+    resp, _ := llm.Complete(ctx, "Explain dagstack in one paragraph.")
+    ```
+  </TabItem>
+</Tabs>
+
+Если плагин не найден, выбрасывается `KindUnknown` (вид не зарегистрирован) или `AmbiguousPlugin` (несколько плагинов с одним `kind+name`).
+
+## Ошибки реестра
+
+Все ошибки наследуются от `PluginRegistryError`:
+
+| Класс | Когда возникает |
+|---|---|
+| `ManifestInvalid` | Манифест не соответствует схеме (отсутствует обязательное поле, неверный тип). |
+| `AmbiguousPlugin` | Два плагина зарегистрированы с одинаковой парой `kind+name`. |
+| `VersionIncompatible` | Плагин объявляет `core_version`, несовместимый с установленной версией ядра. |
+| `KindUnknown` | Вид плагина не зарегистрирован в реестре. |
+| `RuntimeNotSupported` | Плагин не поддерживает ни одну из доступных исполняющих сред (`in_process`, `mcp_stdio`, `mcp_http`). |
+| `DependencyCycle` | Топологическая сортировка обнаружила цикл в декларированных зависимостях между плагинами. |
+| `TeardownErrors` | Агрегированная ошибка, если `teardown_all()` поймал исключения в нескольких плагинах. |
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import PluginRegistry
+    from dagstack.plugin_system import ManifestInvalid, PluginRegistryError
+
+    registry = PluginRegistry()
+    try:
+        registry.discover("plugins/")
+    except ManifestInvalid as exc:
+        print(f"Invalid manifest: {exc}")
+        raise
+    except PluginRegistryError:
+        raise
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        switch {
+        case errors.Is(err, pluginsystem.ErrManifestInvalid):
+            slog.Error("invalid manifest", "err", err)
+        case errors.Is(err, pluginsystem.ErrAmbiguousPlugin):
+            slog.Error("ambiguous plugin", "err", err)
+        case errors.Is(err, pluginsystem.ErrDependencyCycle):
+            slog.Error("dependency cycle", "err", err)
+        default:
+            slog.Error("registry error", "err", err)
+        }
+        return err
+    }
+    _ = entries
+    ```
+  </TabItem>
+</Tabs>
+
+## Инварианты
+
+Реестр поддерживает следующие инварианты поверх жизненного цикла плагинов:
+
+- **Идемпотентность `setup_all()`**. Повторный вызов без предварительного `teardown_all()` — no-op (плагины уже инициализированы).
+- **Порядок teardown — обратный setup**. Если `setup_all()` инициализировал плагины в порядке `A → B → C`, то `teardown_all()` вызовет `teardown` в порядке `C → B → A`.
+- **Partial failure в setup**. Если `setup` одного плагина выбрасывает исключение, уже инициализированные плагины получают `teardown`, и исходное исключение пробрасывается наверх.
+- **Безопасность повторных `get`**. Один и тот же `kind+name` возвращает один и тот же экземпляр плагина.

@@ -1,0 +1,11 @@
+{
+  "label": "Классы диспетчеризации",
+  "position": 6,
+  "collapsible": true,
+  "collapsed": true,
+  "link": {
+    "type": "generated-index",
+    "title": "Классы диспетчеризации — end-to-end",
+    "description": "По странице на каждый из пяти классов: полный walkthrough — hookspec вида + несколько плагинов + вызов диспетчера + типичные ошибки."
+  }
+}

@@ -1,0 +1,11 @@
+{
+  "label": "Python",
+  "position": 1,
+  "collapsible": true,
+  "collapsed": true,
+  "link": {
+    "type": "generated-index",
+    "title": "API Python",
+    "description": "Автогенерируемая справка по публичному API пакета dagstack-plugin-system."
+  }
+}

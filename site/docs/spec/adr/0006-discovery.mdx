@@ -1,0 +1,312 @@
+---
+sidebar_position: 6
+title: ADR-0006 · File-based discovery
+description: Normative contract for the discover(path) function — dagstack.toml as the canonical manifest, entry_point REQUIRED, namespace isolation through importlib, directory traversal rules.
+slug: /spec/adr/0006-discovery
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0006 · File-based discovery
+
+**Status**: accepted v1.0 (2026-04-17) · [Full normative text](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0006-file-based-plugin-discovery.md)
+
+## Why a separate discovery mechanism
+
+[ADR-0001](./0001-core) describes two basic plugin registration mechanisms:
+
+1. `register_module(module)` — programmatic registration of an in-tree module.
+2. `load_entry_points(group)` — loading pip-installed plugins via `importlib.metadata`.
+
+Both require the application to make an explicit call for every plugin or to pre-install via pip. In practice, plugins inside applications live in project directories:
+
+```
+plugins/
+├── llm/openai_compatible/
+│   ├── dagstack.toml
+│   └── plugin.py
+├── chunker/semantic/
+│   ├── dagstack.toml
+│   └── plugin.py
+└── tool/semantic_search/
+    ├── dagstack.toml
+    └── plugin.py
+```
+
+Adding a plugin = creating a folder with a `dagstack.toml` plus an implementation module. Removing one = deleting the folder. No registry edits, no `register_module(...)` calls, no pip install.
+
+**Problem**: without a built-in discovery mechanism, every application has to write its own boilerplate — directory traversal, TOML parsing, entry-point lookup, register call. The same logic is repeated identically in every application.
+
+ADR-0006 fixes the normative contract for the `discover(path)` function — a built-in folder-based discovery mechanism that behaves identically across all implementations.
+
+## Key requirements
+
+ADR-0006 is built from six requirements:
+
+1. **Declarative** — a plugin is fully described by `dagstack.toml` plus an implementation module. No registration boilerplate.
+2. **Convention over configuration** — fixed structure: `dagstack.toml` at the plugin root, `entry_point` is a mandatory field.
+3. **Composability** — multiple `discover()` calls (project + pip-installed + user-local) all register into a single registry.
+4. **Multi-language** — the `dagstack.toml` format is identical for Python, TypeScript, and Go.
+5. **Namespace isolation** — loading via `importlib` (in Python) without polluting `sys.path`; equivalent mechanisms in other languages.
+6. **Hot-reload ready** — the structure is compatible with watch+reload without restart (Phase 2+).
+
+## `dagstack.toml` — canonical manifest
+
+Every plugin MUST have a `dagstack.toml` in its root directory. `entry_point` is a mandatory field.
+
+```toml
+[plugin]
+name = "openai_compatible"
+kind = "llm"
+runtime = "in_process"
+entry_point = "plugin:OpenAIPlugin"       # REQUIRED
+priority = 0
+core_version = ">=0.2.0"
+
+[plugin.resources]
+required = ["config"]
+optional = ["http_client"]
+
+[plugin.metadata]
+description = "OpenAI-compatible LLM backend (OpenRouter, vLLM, Ollama)"
+author = "dagstack"
+license = "Apache-2.0"
+```
+
+The format is **the same** for folder-based discovery and for pip packages. Pip-installed plugins include `dagstack.toml` in package data; `load_entry_points()` finds it via `importlib.resources`.
+
+**`kind` is an opaque string**: plugin-system does NOT validate the `kind` value; that is the application's responsibility (it registers the hookspecs of the kinds it expects). plugin-system stores and groups plugins by `kind` but assigns no semantics to it.
+
+## Entry-point resolution through importlib (without sys.path)
+
+`entry_point` is resolved relative to the plugin directory through a mechanism that does not require modifying `sys.path`. In Python — through `importlib.util.spec_from_file_location`:
+
+```python
+import importlib.util
+import sys
+
+def _load_entry_point(plugin_dir: Path, plugin_name: str, entry_point: str) -> type:
+    module_name, class_name = entry_point.split(":")
+    file_path = plugin_dir / f"{module_name}.py"
+    if not file_path.is_file():
+        raise ManifestInvalid(f"Entry point module not found: {file_path}")
+
+    qualified = f"dagstack._discovered.{plugin_name}.{module_name}"
+    spec = importlib.util.spec_from_file_location(qualified, file_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[qualified] = mod
+    spec.loader.exec_module(mod)
+    return getattr(mod, class_name)
+```
+
+**Namespace isolation**: every `plugin.py` is loaded into a unique namespace `dagstack._discovered.<plugin_name>.<module>`. Collisions are impossible even if every plugin names its module `plugin.py`. Equivalent mechanisms exist in other implementations (dynamic import in Node, the plugin package in Go).
+
+## `discover()` signature
+
+```
+discover(
+    path: str | Path,
+    *,
+    recursive: bool = True,
+    ignore: list[str] | None = None,
+) -> PluginRegistry
+```
+
+**Arguments**:
+
+- `path` — the root directory to scan.
+- `recursive` (default `true`) — traverse subdirectories. A folder containing `dagstack.toml` is a leaf plugin; we do not descend into it any further.
+- `ignore` — directory names to skip. Defaults to `DEFAULT_IGNORE`.
+
+**DEFAULT_IGNORE** (recommended minimum; the exact contents live in `_meta/default_ignore.yaml`):
+
+```
+__pycache__/
+node_modules/
+.git/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+dist/
+build/
+```
+
+**Algorithm**:
+
+1. Traverse `path` recursively.
+2. Collect every directory containing a `dagstack.toml` (do not recurse further into it — a plugin is a leaf).
+3. Parse all manifests. Check uniqueness of `(kind, name)` — a duplicate raises `AmbiguousPlugin`.
+4. Topologically sort by `depends_on` to produce the correct load order.
+5. In topo order: resolve `entry_point` (see above), call `_register(manifest)`. A failure of one plugin is logged and skipped (continue-on-failure).
+6. Return a `PluginRegistry` with the registered plugins.
+
+## Usage example
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="main.py"
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+    registry = PluginRegistry()
+
+    # Project plugins.
+    registry.discover("plugins/")
+
+    # Optional — user-local plugins, registered into the same registry.
+    registry.discover("~/.config/my-app/plugins/")
+
+    # Build a PluginContext (config, logger, resources, …) and run setup.
+    ctx = PluginContext(...)
+    await registry.setup_all(ctx)
+    ```
+
+    :::note Phase 0 covers folder-based discovery only
+
+    `0.1.0-rc.2` ships `PluginRegistry.discover(path)` for in-tree plugins.
+    `load_entry_points()` (pip-installed plugins) and `merge()` (combining
+    independent registries) are reserved for Phase 1+ — until then, point
+    every `discover()` call at a single root or call `discover()` repeatedly
+    on the same registry, which appends new plugins without merging.
+
+    :::
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    const result = await discover(registry, "plugins/", {
+      ignore: ["node_modules", ".git", "dist", "build"],
+    });
+    if (result.failures.length > 0) {
+      console.warn("Discovery failures:", result.failures);
+    }
+    ```
+
+    Default ignore-list and continue-on-failure semantics match ADR-0006 §6 — see the [Discovery concept](/docs/concepts/discovery) for the full list.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="main.go"
+    // Discover walks the filesystem and returns parsed manifest entries. It
+    // does NOT register them — Go's import system links plugin code at
+    // compile time, so the host instantiates each Plugin and calls
+    // RegisterManifest explicitly. This is the deliberate tradeoff with
+    // Python's importlib-based dynamic loading.
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        return err
+    }
+
+    // Optional second tree — entries from multiple Discover calls flow into
+    // the same Registry. The Phase 1 binding does not ship a separate
+    // Merge() helper; concatenate the entry slices and register them in one
+    // pass instead.
+    userEntries, _ := pluginsystem.Discover("~/.config/my-app/plugins/")
+    entries = append(entries, userEntries...)
+
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        // The host owns plugin construction: lookup the constructor by
+        // entry.Manifest.Name (or by entry.Manifest.EntryPoint as an opaque
+        // identifier) and instantiate the Plugin in-process.
+        plugin := constructPlugin(entry.Manifest)
+        if err := reg.RegisterManifest(entry.Manifest, plugin); err != nil {
+            return err
+        }
+    }
+
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        return err
+    }
+    ```
+
+    :::info Entry-point loading is host-driven in Go
+
+    The Go binding's `Discover` returns parsed `ManifestEntry` values; it does
+    **not** dynamically link plugin code (Go has no `importlib` analogue —
+    binaries link at compile time). The host maps each manifest's
+    `entry_point` to a constructor it knows about and calls
+    `Registry.RegisterManifest(entry.Manifest, plugin)`. Pip-installed-style
+    `LoadEntryPoints` is therefore not part of the Go surface — Go plugins
+    distribute as importable modules in `go.mod`, not as runtime-loadable
+    artefacts.
+
+    :::
+  </TabItem>
+</Tabs>
+
+Each `discover()` call returns an independent registry; `merge()` combines them with a `(kind, name)` uniqueness check. The consumer application decides the order of `discover()` calls and which sources to include.
+
+## Directory layout conventions
+
+```
+plugins/                           # root, passed to discover()
+├── {category}/                    # optional grouping for humans
+│   └── {plugin_name}/            # plugin root
+│       ├── dagstack.toml         # REQUIRED
+│       ├── plugin.py             # entry_point module
+│       ├── tests/                # locally-run contract tests (optional)
+│       └── README.md             # plugin description (optional)
+└── {plugin_name}/                # a flat layout is also valid
+    ├── dagstack.toml
+    └── plugin.py
+```
+
+- **Category directories** (`llm/`, `tool/`, `chunker/`) are a grouping for humans. `kind` is taken from `dagstack.toml`, not from the path.
+- **The plugin directory name** SHOULD match `name` in the manifest for readability, but this is not required.
+- **`tests/` inside a plugin** — for plugin-local contract tests.
+
+## Interaction with other mechanisms
+
+| Mechanism | Use case | Priority in the application |
+|---|---|---|
+| `discover(path)` | In-project plugins, folder-based | Primary |
+| `register_module(mod)` | Programmatic registration, bridges, testing | Fallback |
+| `load_entry_points()` | Pip-installed plugins | Secondary (distribution) |
+
+All three register into the same `PluginRegistry`. Duplicates of `(kind, name)` raise `AmbiguousPlugin` rather than silently overriding. An explicit override API is reserved for Phase 1+; today, resolve the duplicate at the manifest level (rename the plugin, drop the duplicate folder, or filter the discovery root with `ignore=`).
+
+## Migrating away from existing boilerplate patterns
+
+Applications that still write their own discovery code (directory traversal, TOML parsing, registration) MAY migrate to `discover()` incrementally:
+
+1. Keep the existing boilerplate for backward compatibility until all plugins have been moved onto `dagstack.toml`.
+2. Create new plugins straight away under `plugins/<name>/dagstack.toml + plugin.py`.
+3. Once all plugins are migrated, remove the boilerplate and replace it with a `discover("plugins/")` call in the lifespan.
+
+## Consequences
+
+**Positive:**
+
+- **Zero-boilerplate** plugin onboarding — create a folder with two files and you are done.
+- **Namespace isolation** through `importlib` — plugins do not conflict with each other even if they use identical module names.
+- **A single manifest format** (`dagstack.toml`) for folder-based and pip packages — a pip plugin moves into `plugins/` by being copied.
+- **Hot-reload ready** — directory watcher + repeat `discover()` = dev-mode in future phases.
+- **Testability** — plugin-local `tests/` lets contract tests for each plugin run in isolation.
+
+**Trade-offs:**
+
+- **Relative imports between a plugin's modules** are constrained by the `importlib` mechanism. Mitigation: simple plugins use a single module (`plugin.py`); complex plugins with multiple modules become a pip package with proper package setup.
+- **Dependency resolution across different `discover()` calls** — `depends_on` works inside a single call (via topo-sort). Between multiple calls, dependencies are not honoured — the order of calls determines the order of registration.
+- **Security — auto-discover = auto-execute**. Any code in `plugin.py` inside a scanned directory will be executed at load time. Mitigation: the `ignore` parameter, plus a future ADR on plugin signing.
+
+**What this ADR forbids**:
+
+- Modifying `sys.path` during plugin loading — normatively prohibited so that namespace isolation is not broken.
+- Resolving `entry_point` against `sys.path` — only through `importlib.util.spec_from_file_location` (in Python) or the equivalent in other languages.
+- Interpreting `kind` inside plugin-system core — it is an opaque string; the consumer application assigns its semantics.
+
+## Related ADRs
+
+- [ADR-0001](./0001-core) — the basic registration mechanisms that ADR-0006 extends with a folder-based variant.
+- [ADR-0004](./0004-hookspec) — `dagstack.toml` uses hookspec contracts for manifest validation.
+
+## Normative source
+
+Full text of ADR-0006 with the formal directory-traversal algorithm, namespace-resolution pseudo-code, and discussion of resolved and open questions: [`plugin-system-spec/adr/0006-file-based-plugin-discovery.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0006-file-based-plugin-discovery.md).
+
+The full `DEFAULT_IGNORE` list lives in [`_meta/default_ignore.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta) of the spec repository.

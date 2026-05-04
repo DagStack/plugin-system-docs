@@ -1,0 +1,11 @@
+{
+  "label": "Format reference",
+  "position": 7,
+  "collapsible": true,
+  "collapsed": true,
+  "link": {
+    "type": "generated-index",
+    "title": "Format reference",
+    "description": "Exact tables of every manifest field, built-in kind, runtime adapter, and error class. For quick lookup while writing a plugin or doing a review."
+  }
+}

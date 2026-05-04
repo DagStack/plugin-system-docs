@@ -1,0 +1,196 @@
+---
+sidebar_position: 5
+title: Runtimes
+description: The three runtime adapters — in_process, mcp_stdio, mcp_http. How to choose, how to declare, and what they imply for serialisation and lifecycle.
+slug: /concepts/runtimes
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Runtimes
+
+A plugin declares one or more **runtimes** in its manifest — the channels through which the core can talk to it:
+
+```toml
+[plugin]
+runtime = "in_process"        # a single runtime
+# or
+runtime = ["in_process", "mcp_stdio"]   # the plugin works under several runtimes
+```
+
+The core picks a suitable adapter at load time and talks to the plugin through it. For consumers (the code that fetches a plugin from the registry and calls its methods) the difference between runtimes is **invisible** — every adapter returns a uniform proxy object.
+
+## The three runtimes
+
+### `in_process` — native call in the same process
+
+The plugin lives in the same process as the core. A hook call is a direct method call on the plugin object, with no serialisation.
+
+**When to use**:
+
+- The plugin is written in the same language as the core.
+- The plugin needs no isolation (trusted code).
+- Performance is critical (millions of calls per second).
+
+**Limitations**:
+
+- The plugin must live in a package importable by the core.
+- A plugin crash (segfault in a C extension, memory leak, deadlock) crashes the core.
+
+### `mcp_stdio` — subprocess over stdio
+
+The plugin runs as a separate process; communication goes through stdin/stdout using the MCP protocol (JSON-RPC 2.0 over line-delimited JSON).
+
+**When to use**:
+
+- The plugin is written in a different language (Python core, Go plugin).
+- Isolation is required (a third-party plugin from an untrusted source).
+- The plugin pulls in heavy dependencies (C extension, ML model) that you do not want in the main process.
+
+**Limitations**:
+
+- All inputs and outputs must be JSON-serialisable (invariant 2 of [ADR-0003](../spec/adr/0003-runtime-invariants)).
+- Per-call overhead — process spawn (once per plugin lifetime) plus JSON serialisation (per call). Not suitable for hot paths with strict latency budgets.
+
+### `mcp_http` — remote HTTP service
+
+The plugin is deployed as a standalone service reachable over HTTP. The core sends MCP requests over HTTP.
+
+**When to use**:
+
+- The plugin is an external service (SaaS, corporate microservice).
+- The plugin needs special infrastructure (a GPU instance, a horizontally scaled worker pool).
+- You want to update the plugin without restarting the core.
+
+**Limitations**:
+
+- The network is an extra failure point (timeouts, transient errors).
+- All `mcp_stdio` constraints plus its own — auth tokens, TLS, CA bundles.
+- Per-call overhead = network round-trip + JSON serialisation.
+
+## Comparison table
+
+| Property | `in_process` | `mcp_stdio` | `mcp_http` |
+|---|---|---|---|
+| Different languages for core and plugin | ✗ | ✓ | ✓ |
+| Isolation from the main process | ✗ | ✓ (subprocess) | ✓ (separate host) |
+| Call latency | ~μs | ~10–100 μs | ~ms |
+| Serialisation required | ✗ (native objects) | ✓ (JSON) | ✓ (JSON) |
+| Network errors | impossible | impossible | possible |
+| Deploy independent of the core | ✗ | ✓ | ✓ |
+| Suitable for high-traffic live streams | ✓ | ✗ | ✗ |
+
+## Multiple runtimes in a single plugin
+
+A plugin may declare several runtime adapters:
+
+```toml
+runtime = ["in_process", "mcp_stdio"]
+```
+
+This means the core may launch the plugin under any of the listed modes; the choice rests with the host. Typical scenario:
+
+- **in_process** — when both core and plugin are in Python: a direct import.
+- **mcp_stdio** — when the core is in TypeScript and the plugin is Python-only: launch as a subprocess.
+
+Each binding is responsible for implementing the adapter for the runtimes it supports.
+
+## Declaring a runtime for your plugin
+
+Minimal case — a single runtime:
+
+```toml
+[plugin]
+name = "openai_compatible"
+kind = "llm"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+```
+
+Multiple — an array:
+
+```toml
+[plugin]
+name = "semantic_search"
+kind = "tool"
+runtime = ["in_process", "mcp_stdio", "mcp_http"]
+core_version = ">=0.1.0,<1.0.0"
+```
+
+## Runtime-specific manifest fields
+
+Each runtime adapter may define its own fields. A separate `groupId` from the language-example tab blocks keeps the "my language" choice from being confused with the "which runtime are we discussing" choice.
+
+<Tabs groupId="runtime-spec">
+  <TabItem value="in_process" label="in_process">
+    ```toml
+    [plugin]
+    runtime = "in_process"
+    entry_point = "plugin:OpenAIPlugin"    # REQUIRED for in_process
+    ```
+  </TabItem>
+  <TabItem value="mcp_stdio" label="mcp_stdio">
+    ```toml
+    [plugin]
+    runtime = "mcp_stdio"
+
+    [plugin.mcp_stdio]
+    command = ["python", "-m", "openai_plugin"]
+    startup_timeout_sec = 30
+    ```
+  </TabItem>
+  <TabItem value="mcp_http" label="mcp_http">
+    ```toml
+    [plugin]
+    runtime = "mcp_http"
+
+    [plugin.mcp_http]
+    url = "https://plugins.example.com/openai"
+    auth_header = "X-API-Token"
+    timeout_sec = 60
+    ```
+  </TabItem>
+</Tabs>
+
+The full schema for every runtime adapter lives in the [spec repository](https://github.com/dagstack/plugin-system-spec/tree/main/_meta).
+
+## Choosing a runtime — flowchart
+
+```
+┌─ Is the plugin in the same language as the core?
+│
+├─ Yes → is isolation required?
+│        │
+│        ├─ No, and performance matters
+│        │   → in_process
+│        │
+│        └─ Yes, plugin from an untrusted source
+│            → mcp_stdio
+│
+└─ No (different languages):
+     │
+     ├─ The plugin is an external service (SaaS, corporate microservice)
+     │   → mcp_http
+     │
+     └─ The plugin is local and needs to be installed on the host
+         → mcp_stdio
+```
+
+## Consequences of the runtime choice for plugin code
+
+| Invariant | in_process | mcp_stdio | mcp_http |
+|---|---|---|---|
+| Serializable boundaries ([ADR-0003 §2](../spec/adr/0003-runtime-invariants)) | recommended | required | required |
+| Resources via DI | required | required | required |
+| Freedom from external environment state | required | required | required |
+| `execution_model` is meaningful | yes | no (process boundary) | no (network boundary) |
+
+**Key observation**: all three runtime adapters require the same runtime invariants. This makes migrating a plugin from `in_process` to `mcp_stdio` (for example, when you need to spin it out into a subprocess for isolation) a **mechanical** change — the plugin code does not move, only the manifest does.
+
+## See also
+
+- [Plugin manifest](./manifest) — the full `runtime` field and runtime-specific sections.
+- [Discovery](./discovery) — how the core selects an adapter at load time.
+- [Runtime invariants](./invariants) — the eight invariants that every runtime adapter must uphold.
+- [ADR-0003: Orchestration-neutral runtime](../spec/adr/0003-runtime-invariants) — the normative contract.

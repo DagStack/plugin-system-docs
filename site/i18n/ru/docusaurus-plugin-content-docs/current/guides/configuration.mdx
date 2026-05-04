@@ -1,0 +1,211 @@
+---
+sidebar_position: 2
+title: Конфигурация плагинов
+description: Как плагин получает свои настройки через dagstack/config-spec — объявление секции, чтение в setup, валидация pydantic-схемой.
+slug: /guides/configuration
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Конфигурация плагинов
+
+Плагины получают свои настройки через единый механизм `dagstack/config-spec`. Конфиг приложения — иерархический YAML-файл со слоями (`app-config.yaml` → `app-config.local.yaml` → `app-config.${DAGSTACK_ENV}.yaml`). Каждый плагин объявляет собственную секцию и получает её содержимое в `setup`.
+
+## Секция плагина в конфиге
+
+Имя секции = `<kind>.<name>`. Для плагина `stripe` вида `payment_provider` секция будет `payment_provider.stripe`:
+
+```yaml title="app-config.yaml"
+payment_provider:
+  stripe:
+    base_url: "${STRIPE_BASE_URL:-https://api.stripe.com/v1}"
+    api_key: "${STRIPE_API_KEY}"
+    webhook_secret: "${STRIPE_WEBHOOK_SECRET}"
+    timeout_s: 30
+    max_retries: 3
+```
+
+Подстановка `${VAR:-default}` и `${VAR}` работает автоматически на этапе загрузки конфига.
+
+## Декларация схемы
+
+Плагин объявляет pydantic-схему своей секции. Реестр вызывает её для валидации перед передачей в `setup`. Неверная конфигурация выбрасывает `ManifestInvalid` (или её аналог на других языках) с указанием поля.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugins/payment_provider/stripe/plugin.py"
+    from pydantic import BaseModel, Field
+    from dagstack.plugin_system import PluginContext
+
+
+    class StripeConfig(BaseModel):
+        base_url: str = "https://api.stripe.com/v1"
+        api_key: str = Field(..., min_length=1)
+        webhook_secret: str = Field(..., min_length=1)
+        timeout_s: float = 30.0
+        max_retries: int = 3
+
+
+    class StripeProvider:
+        config_schema = StripeConfig
+
+        async def setup(self, context: PluginContext) -> None:
+            config = StripeConfig(**context.config)  # already validated
+            self._client = build_client(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                timeout=config.timeout_s,
+            )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugins/payment_provider/stripe/plugin.go"
+    package stripe
+
+    import (
+        "context"
+        "encoding/json"
+        "errors"
+        "net/http"
+        "time"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type Config struct {
+        BaseURL       string  `json:"base_url"`
+        APIKey        string  `json:"api_key"`
+        WebhookSecret string  `json:"webhook_secret"`
+        TimeoutS      float64 `json:"timeout_s"`
+        MaxRetries    int     `json:"max_retries"`
+    }
+
+    type StripeProvider struct {
+        cfg    Config
+        client *http.Client
+    }
+
+    func (p *StripeProvider) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        // PluginContext.Config is map[string]any — round-trip through JSON to decode.
+        raw, err := json.Marshal(pluginCtx.Config)
+        if err != nil {
+            return err
+        }
+        cfg := Config{
+            BaseURL:    "https://api.stripe.com/v1",
+            TimeoutS:   30,
+            MaxRetries: 3,
+        }
+        if err := json.Unmarshal(raw, &cfg); err != nil {
+            return err
+        }
+        if cfg.APIKey == "" {
+            return errors.New("payment_provider.stripe.api_key is required")
+        }
+        p.cfg = cfg
+        p.client = &http.Client{Timeout: time.Duration(cfg.TimeoutS * float64(time.Second))}
+        return nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Чувствительные поля и секреты
+
+Поля, содержащие секреты (API-ключи, пароли, токены), должны маскироваться при логировании. `dagstack/config-spec` ведёт список имён полей, которые считаются секретами по умолчанию:
+
+- `api_key`, `secret_key`, `access_token`, `password`, `client_secret`
+- любое поле, чьё имя оканчивается на `_secret`, `_token`, `_password`, `_key`
+
+При печати конфига (например, диагностики на старте) значения этих полей заменяются на `[MASKED]`. Это не отменяет ответственности плагина — не логируйте `config.api_key` напрямую.
+
+## Обновление конфига в runtime
+
+:::info Phase 2 scope
+Подписки на live-обновления секций конфига (`on_section_change` / `Subscription`) — часть Phase 2 интеграции с `dagstack/config-spec` и не входят в `0.1.0-rc.2`. Сегодня плагины получают свой `config` один раз — в `setup`; чтобы применить изменения, нужен цикл `teardown_all()` / `setup_all(ctx)`.
+:::
+
+## Тестирование с временным конфигом
+
+Для модульных тестов передавайте конфиг явно, минуя загрузку из файла:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+    registry = PluginRegistry()
+    context = PluginContext(
+        config={"api_key": "test-key"},
+        logger=logging.getLogger("test"),
+        registry=registry,
+    )
+    plugin = StripeProvider()
+    asyncio.run(plugin.setup(context))
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "context"
+        "log/slog"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    pluginCtx := &pluginsystem.PluginContext{
+        Config: map[string]any{
+            "api_key": "test-key",
+        },
+        Logger:   slog.Default(),
+        Registry: pluginsystem.NewRegistry(),
+    }
+    p := &StripeProvider{}
+    if err := p.Setup(context.Background(), pluginCtx); err != nil {
+        // handle err
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## См. также
+
+- [`dagstack/config-spec`](https://github.com/dagstack/config-spec) — полная спецификация иерархического конфига, подстановок и адаптеров-источников.
+- [Жизненный цикл плагина](./lifecycle) — где применяется конфиг в цикле `setup`/`teardown`.

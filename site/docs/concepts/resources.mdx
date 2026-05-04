@@ -1,0 +1,401 @@
+---
+sidebar_position: 7
+title: Resources (Resources DI)
+description: How the plugin-system injects HTTP clients, database connections, clocks, and randomness sources through PluginContext.resources — protocols, standard implementations, and test substitutions.
+slug: /concepts/resources
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Resources (Resources DI)
+
+The plugin-system follows the principle of **dependency injection for resources**: a plugin does not construct HTTP clients, database connections, or other long-lived objects — it declares which resources it needs and receives them through `PluginContext.resources`. The host application is responsible for the configuration and lifecycle of those resources.
+
+This is a key part of [ADR-0003](../spec/adr/0003-runtime-invariants) — invariant 3, "Resources via dependency injection".
+
+## Why DI is needed for resources
+
+The alternative is for the plugin to construct resources itself:
+
+```python
+# Anti-pattern: the plugin constructs the HTTP client itself.
+class BadPlugin:
+    def setup(self, ctx):
+        self.http = httpx.AsyncClient(
+            verify="/etc/ssl/certs/corp-ca.pem",
+            timeout=30,
+        )
+```
+
+The problems:
+
+1. **The host loses control** — the corporate CA bundle, TLS configuration, and rate limiter ought to be uniform across every plugin, yet each plugin configures them differently.
+2. **Testing**. Substituting `httpx.AsyncClient` with a mock in tests becomes a monkey-patching exercise.
+3. **Isolation**. A plugin that leaks connections starves the application's connection pool; with DI the host owns the shared pool.
+4. **Orchestration neutrality** — if the plugin runs in a separate process (over `mcp_stdio`), its locally constructed HTTP client is useless to the host.
+
+With DI the plugin receives a client **configured by the host** through the context:
+
+```python
+# Correct: the plugin receives a ready-made client.
+class GoodPlugin:
+    def setup(self, ctx):
+        self.http = ctx.resources.http_client
+```
+
+## Standard resources
+
+The v1.0 plugin-system fixes four standard resources available on `PluginContext.resources` (see `STANDARD_RESOURCES` in the Python binding). Each one is a **protocol** (Protocol in Python, an interface in TS/Go); the implementations live within the specific binding package.
+
+| Resource | Protocol | Purpose |
+|---|---|---|
+| `http_client` | `HttpClient` | An HTTP client preconfigured with TLS / CA bundle / timeouts. |
+| `blob_store` | `BlobStore` | An abstract blob store (S3 / FS / in-memory). |
+| `clock` | `Clock` | A time source (freezable in tests). |
+| `rng` | `Rng` | A randomness source (seedable in tests). |
+
+:::info Phase 2 catalogue
+A `tmpdir` resource (a self-cleaning temporary directory bound to plugin lifecycle) is on the Phase 2 roadmap. Until it ships, plugins that need a temp folder use the host's standard library (`tempfile.TemporaryDirectory()` in Python, `os.MkdirTemp` in Go) and clean up in `teardown()`.
+:::
+
+Factory implementations using Python as the example:
+
+- Production: `SystemClock`, `RandomRng`, `InMemoryBlobStore`, `HttpClient` based on `httpx.AsyncClient`.
+- Test: `FrozenClock`, `DeterministicRng` with a seed.
+
+### `http_client`
+
+An HTTP client configured by the host in line with corporate policy: a CA bundle for internal certificates, a retry policy, a rate limiter, and timeouts.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class MyPlugin:
+        def setup(self, ctx):
+            self._http = ctx.resources.http_client
+
+        async def fetch(self, url: str) -> dict:
+            response = await self._http.get(url)
+            response.raise_for_status()
+            return response.json()
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { ResourceRegistry, PluginRegistry } from "@dagstack/plugin-system";
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    // Host registers global resources:
+    const resources = new ResourceRegistry();
+    resources.register("http_client", httpClient);
+    resources.register("postgres", dbPool);
+
+    // Each plugin's manifest declares which resources it needs;
+    // setupAll injects a per-plugin scope into ctx.resources.
+    export class GoodPlugin {
+      private http!: typeof httpClient;
+      async setup(ctx: PluginContext): Promise<void> {
+        this.http = ctx.resources.get<typeof httpClient>("http_client");
+      }
+    }
+
+    const registry = new PluginRegistry();
+    // ... discover + register manifests
+    await registry.setupAll({ resources });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // HTTPClient is a host-side interface — the plugin defines the shape
+    // it needs and casts the resource returned by Resources.Get().
+    type HTTPClient interface {
+        GetJSON(ctx context.Context, url string) (map[string]any, error)
+    }
+
+    type MyPlugin struct {
+        http HTTPClient
+    }
+
+    func (p *MyPlugin) Unwrap() any { return p }
+
+    func (p *MyPlugin) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        raw, err := pluginCtx.Resources.Get("http_client")
+        if err != nil {
+            return err
+        }
+        p.http = raw.(HTTPClient)
+        return nil
+    }
+
+    func (p *MyPlugin) Fetch(ctx context.Context, url string) (map[string]any, error) {
+        return p.http.GetJSON(ctx, url)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### `clock` and `rng`
+
+Time and randomness sources must **always** be used through injection — never `time.time()` / `Math.random()`. This:
+
+- makes the plugin testable (a freezable clock and a seedable RNG yield reproducible tests);
+- ensures determinism for plugins with `idempotency_mode = "output_hash"` (invariant 8 from [ADR-0003](../spec/adr/0003-runtime-invariants)).
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class TimestampedProcessor:
+        def setup(self, ctx):
+            self._clock = ctx.resources.clock
+            self._rng = ctx.resources.rng
+
+        def process(self, data: dict) -> dict:
+            return {
+                **data,
+                "processed_at": self._clock.now().isoformat(),
+                "trace_id": f"trace-{self._rng.randint(0, 2**32)}",
+            }
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { ResourceRegistry, PluginRegistry } from "@dagstack/plugin-system";
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    // Host registers global resources:
+    const resources = new ResourceRegistry();
+    resources.register("http_client", httpClient);
+    resources.register("postgres", dbPool);
+
+    // Each plugin's manifest declares which resources it needs;
+    // setupAll injects a per-plugin scope into ctx.resources.
+    export class GoodPlugin {
+      private http!: typeof httpClient;
+      async setup(ctx: PluginContext): Promise<void> {
+        this.http = ctx.resources.get<typeof httpClient>("http_client");
+      }
+    }
+
+    const registry = new PluginRegistry();
+    // ... discover + register manifests
+    await registry.setupAll({ resources });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type Clock interface{ Now() time.Time }
+    type Rng interface{ UUID4() string }
+
+    type TimestampedProcessor struct {
+        clock Clock
+        rng   Rng
+    }
+
+    func (p *TimestampedProcessor) Unwrap() any { return p }
+
+    func (p *TimestampedProcessor) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        clk, err := pluginCtx.Resources.Get("clock")
+        if err != nil {
+            return err
+        }
+        rng, err := pluginCtx.Resources.Get("rng")
+        if err != nil {
+            return err
+        }
+        p.clock = clk.(Clock)
+        p.rng = rng.(Rng)
+        return nil
+    }
+
+    func (p *TimestampedProcessor) Process(data map[string]any) map[string]any {
+        data["processed_at"] = p.clock.Now().Format(time.RFC3339)
+        data["trace_id"] = fmt.Sprintf("trace-%d", p.rng.Int63())
+        return data
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### `blob_store`
+
+`blob_store` is an abstract interface exposing `put(key, bytes)`, `get(key)`, `delete(key)`, and `list(prefix)`. The implementation is chosen by the host: an `InMemoryBlobStore` in tests, or, in production, an implementation backed by S3 or the file system.
+
+## Declaring resources in the manifest
+
+The plugin declares the resources it needs:
+
+```toml
+[plugin.resources]
+required = ["http_client", "clock"]
+optional = ["blob_store", "rng"]
+```
+
+- `required` — the plugin will not work without them. If the host does not provide `http_client`, the plugin is marked `unavailable` with a clear error.
+- `optional` — the plugin works without them; `ctx.resources.blob_store` will be `None`, and the plugin must handle that.
+
+## Substituting resources in tests
+
+Substituting standard resources with test versions is the usual approach for unit tests:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import logging
+    from datetime import datetime, timezone
+
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+    from dagstack.plugin_system import (
+        FrozenClock,
+        DeterministicRng,
+        InMemoryBlobStore,
+        ResourceRegistry,
+    )
+
+
+    def test_timestamped_processor():
+        resources = ResourceRegistry()
+        resources.register(
+            "clock",
+            FrozenClock(at=datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)),
+        )
+        resources.register("rng", DeterministicRng(seed=42))
+        resources.register("blob_store", InMemoryBlobStore())
+
+        registry = PluginRegistry(resource_registry=resources)
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("test"),
+            registry=registry,
+        )
+
+        plugin = TimestampedProcessor()
+        plugin.setup(ctx)
+
+        result = plugin.process({"text": "hello"})
+        assert result["processed_at"].startswith("2026-01-01T12:00:00")
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { ResourceRegistry, PluginRegistry } from "@dagstack/plugin-system";
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    // Host registers global resources:
+    const resources = new ResourceRegistry();
+    resources.register("http_client", httpClient);
+    resources.register("postgres", dbPool);
+
+    // Each plugin's manifest declares which resources it needs;
+    // setupAll injects a per-plugin scope into ctx.resources.
+    export class GoodPlugin {
+      private http!: typeof httpClient;
+      async setup(ctx: PluginContext): Promise<void> {
+        this.http = ctx.resources.get<typeof httpClient>("http_client");
+      }
+    }
+
+    const registry = new PluginRegistry();
+    // ... discover + register manifests
+    await registry.setupAll({ resources });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::warning Test-resource fakes are host-side
+    `go.dagstack.dev/plugin-system v0.1.0-rc.1` does not bundle `FrozenClock` / `DeterministicRng` / `InMemoryBlobStore` — those fakes belong with the host application that owns the resource interfaces. The pattern: define `Clock` / `Rng` / `BlobStore` interfaces in your application package, ship test fakes alongside them, and feed them through a host-side `Resources` implementation that exposes `Get(name string) (any, error)`. Pass the resulting `*pluginsystem.PluginContext` straight into `plugin.Setup(ctx, pluginCtx)` in tests.
+    :::
+  </TabItem>
+</Tabs>
+
+## Custom resources
+
+The application may register its own resources — for example, `postgres`, `tenant_registry`, `rate_limiter`. The plugin lists them under `resources.required/optional`, and the application creates them and passes them in during initialisation.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # Inside the application (FastAPI lifespan, Dagster main()):
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+    from dagstack.plugin_system import ResourceRegistry
+
+    resources = ResourceRegistry()
+    resources.register("http_client", await create_http_client())
+    resources.register("postgres", await create_pg_pool())          # custom
+    resources.register("tenant_registry", tenant_registry)          # custom
+
+    registry = PluginRegistry(resource_registry=resources)
+    registry.discover("plugins/")
+
+    ctx = PluginContext(
+        config={},
+        logger=logging.getLogger("app"),
+        registry=registry,
+    )
+    await registry.setup_all(ctx)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { ResourceRegistry, PluginRegistry } from "@dagstack/plugin-system";
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    // Host registers global resources:
+    const resources = new ResourceRegistry();
+    resources.register("http_client", httpClient);
+    resources.register("postgres", dbPool);
+
+    // Each plugin's manifest declares which resources it needs;
+    // setupAll injects a per-plugin scope into ctx.resources.
+    export class GoodPlugin {
+      private http!: typeof httpClient;
+      async setup(ctx: PluginContext): Promise<void> {
+        this.http = ctx.resources.get<typeof httpClient>("http_client");
+      }
+    }
+
+    const registry = new PluginRegistry();
+    // ... discover + register manifests
+    await registry.setupAll({ resources });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // Resources is host-defined. The host implements pluginsystem.Resources
+    // (a single Get(name) (any, error) method) and feeds the implementation
+    // into PluginContext.Resources.
+    resources := myhost.NewResources(map[string]any{
+        "http_client":     createHTTPClient(),
+        "postgres":        createPgPool(),
+        "tenant_registry": tenantRegistry,
+    })
+
+    entries, _ := pluginsystem.Discover("plugins/")
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        _ = reg.RegisterManifest(entry.Manifest, buildPlugin(entry.Manifest))
+    }
+
+    pluginCtx := &pluginsystem.PluginContext{
+        Logger:    slog.Default(),
+        Registry:  reg,
+        Resources: resources,
+    }
+    _ = reg.SetupAll(ctx, pluginCtx)
+    ```
+  </TabItem>
+</Tabs>
+
+## Rules for resources
+
+1. **Protocol-typed.** The interface of a resource must be specified formally (Protocol / interface). Without that, decoration breaks (see ADR-0005 §3).
+2. **Thread-safe / goroutine-safe.** Resources are singletons on the host and are accessed by several plugins simultaneously.
+3. **Lifecycle is owned by the host.** The resource is created before plugin setup and destroyed after teardown.
+4. **Do not pass custom state through resources.** A resource is a means of accessing infrastructure, not a container for business logic.
+
+## See also
+
+- [ADR-0003: Orchestration-neutral runtime](../spec/adr/0003-runtime-invariants) — invariant 3 "Resources DI" and the full list of standard resources.
+- [ADR-0005: Horizontal extensions](../spec/adr/0005-horizontal-hooks) — decoration of resources for quota / observability.
+- [Runtime invariants](./invariants) — how DI fits into overall orchestration neutrality.
+- [Guide: Plugin configuration](../guides/configuration) — how the config section is passed to a plugin at start-up.

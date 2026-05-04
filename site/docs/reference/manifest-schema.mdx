@@ -1,0 +1,178 @@
+---
+sidebar_position: 1
+title: dagstack.toml schema
+description: Full table of every plugin manifest field — required and optional — with types, defaults, and a normative reference.
+slug: /reference/manifest-schema
+---
+
+# `dagstack.toml` schema
+
+The full table of plugin manifest fields. The normative JSON Schema 2020-12 lives in the spec repository: [`_meta/manifest.schema.json`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta).
+
+The manifest may live in one of four formats:
+
+- `dagstack.toml` (Python and Go convention) — the **primary format**.
+- `dagstack.json` (TypeScript / Node convention).
+- A `[tool.dagstack.plugin]` section in `pyproject.toml` (for Python plugins on PyPI).
+- A `dagstack` field in `package.json` (for TypeScript plugins on npmjs.org).
+
+When several formats are present, precedence is `dagstack.toml` → `dagstack.json` → embedded in the package.
+
+## Root section `[plugin]`
+
+### Required fields
+
+| Field | Type | Description |
+|---|---|---|
+| `schema_version` | `string` | Manifest JSON-schema version. On v1.0, `"1"`. |
+| `name` | `string` | Plugin name, unique within its `kind`. Lower-case letters, digits, `-`, `_`. |
+| `kind` | `string` | Plugin kind — opaque to the core; the application defines the list of kinds. |
+| `runtime` | `string` \| `string[]` | Execution runtime: `"in_process"` / `"mcp_stdio"` / `"mcp_http"`. An array is allowed. |
+| `core_version` | `string` | Semver range for the `dagstack-plugin-system` version. Example: `"^0.2"`, `">=0.3.0 <1.0.0"`. |
+| `entry_point` | `string` | Module and class: `"module:ClassName"`. **REQUIRED for in_process**. |
+
+### Metadata
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `version` | `string` | — | Semver version of the plugin itself. |
+| `description` | `string` | — | Short human-readable description. |
+| `authors` | `string[]` | `[]` | List of authors. |
+| `homepage` | `string` | — | URL of the plugin's home page. |
+| `license` | `string` | — | SPDX licence identifier (for example, `"Apache-2.0"`). |
+
+### Lifecycle and ordering (ADR-0002)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `priority` | `int` (`0..100`) | `0` | Priority for dispatch and lifecycle ordering. Higher = earlier / more important. The range `[1000, ∞)` is reserved for horizontal middleware (ADR-0005). |
+| `depends_on` | `string[]` \| `object[]` | `[]` | List of dependency plugin names (or an array of `{kind, name}` objects for the full form). |
+| `tryfirst` | `bool` | `false` | Debug escape hatch: forces this plugin to run first. Not a substitute for `priority` / `depends_on` in production. |
+| `trylast` | `bool` | `false` | Forces this plugin to run last. Incompatible with `tryfirst=true`. |
+| `startup_timeout_sec` | `int` | `30` | Timeout for the plugin's `setup()`. |
+| `teardown_timeout_sec` | `int` | `15` | Timeout for `teardown()`. |
+
+### Dispatch (ADR-0002)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `execution_model` | `string` | `"sync"` | `"async"` / `"sync"` / `"thread_cpu_bound"` / `"process_cpu_bound"`. |
+| `in_process_only` | `bool` | `false` | If `true`, the plugin lives only in the `in_process` runtime (it cannot be isolated through MCP). |
+| `supports_languages` | `string[]` | `[]` | For `capability` dispatch: languages the plugin handles. |
+| `supports_extensions` | `string[]` | `[]` | For `capability` dispatch: file extensions. |
+| `supports_mime_types` | `string[]` | `[]` | For `capability` dispatch: MIME types. |
+| `fallback` | `bool` | `false` | If `true`, the plugin accepts any input that did not match another plugin. Exactly one per `kind`. |
+| `capabilities` | `string[]` | `[]` | Arbitrary capability identifiers (for governance filtering and custom routing). |
+
+## `[plugin.resources]` section
+
+Declares the resources the plugin expects to receive through `PluginContext.resources`.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `required` | `string[]` | `[]` | Required resources. If they are missing, the plugin is marked `unavailable`. |
+| `optional` | `string[]` | `[]` | Optional resources. Accessing them yields `None` when not provided. |
+
+Standard resource names are listed on the [Standard resources](./resources-list) page.
+
+## `[plugin.unit_of_work]` section
+
+For long-running plugins that execute UoWs through an orchestrator (ADR-0003 §5).
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `declared` | `bool` | `false` | `true` — the plugin is a UoW plugin. |
+| `partition_key` | `string` | — | Sharding key (`tenant_id`, `repo_id`, ...). |
+| `estimated_duration_sec` | `int` | — | Duration estimate — a hint for the scheduler. |
+| `idempotency_mode` | `string` | `"none"` | `"input_hash"` / `"output_hash"` / `"none"`. |
+| `checkpointable` | `bool` | `false` | Whether the plugin supports resume via `ctx.checkpoint`. |
+| `content_hash` | `string[]` | `[]` | Fields used to compute the idempotency key. |
+
+## `[plugin.mcp_stdio]` section (for `runtime = "mcp_stdio"`)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `command` | `string[]` | — | **REQUIRED**. Subprocess launch command (arguments are passed as an array). |
+| `working_dir` | `string` | process cwd | Subprocess working directory. |
+| `env` | `object` | `{}` | Environment variables for the subprocess. |
+| `startup_timeout_sec` | `int` | `30` | Initial handshake timeout. |
+
+## `[plugin.mcp_http]` section (for `runtime = "mcp_http"`)
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `url` | `string` | — | **REQUIRED**. Base URL of the MCP service. |
+| `auth_header` | `string` | — | HTTP header name for the bearer token. |
+| `auth_secret_env` | `string` | — | Name of the env variable holding the secret (the host substitutes it into the header). |
+| `timeout_sec` | `int` | `60` | Per-request timeout. |
+| `tls_ca_bundle` | `string` | — | Path to a corporate CA bundle for TLS (optional). |
+
+## `[plugin.metadata]` section
+
+Arbitrary keys, not interpreted by the plugin-system core. They may be used by the application or by horizontal middleware.
+
+```toml
+[plugin.metadata]
+owner_team = "search-platform"
+runbook = "https://runbook.example.org/chunker"
+on_call = "search-oncall@example.com"
+```
+
+## Full example
+
+```toml title="plugins/advanced-chunker/dagstack.toml"
+[plugin]
+schema_version = "1"
+name = "advanced-chunker"
+kind = "chunker"
+runtime = ["in_process", "mcp_stdio"]
+core_version = ">=0.1.0,<1.0.0"
+entry_point = "plugin:AdvancedChunker"
+version = "1.2.0"
+description = "Tree-sitter-based semantic chunker with a length fallback."
+authors = ["dagstack"]
+license = "Apache-2.0"
+
+priority = 50
+depends_on = ["tokenizer"]
+execution_model = "thread_cpu_bound"
+
+supports_languages = ["python", "typescript", "go"]
+supports_extensions = [".py", ".ts", ".go"]
+fallback = false
+
+[plugin.resources]
+required = ["clock"]
+optional = ["blob_store"]
+
+[plugin.unit_of_work]
+declared = true
+partition_key = "repo_id"
+idempotency_mode = "input_hash"
+checkpointable = true
+
+[plugin.mcp_stdio]
+command = ["python", "-m", "advanced_chunker.server"]
+startup_timeout_sec = 60
+
+[plugin.metadata]
+owner_team = "search-platform"
+runbook = "https://runbook.example.org/chunker"
+```
+
+## Validation
+
+The core validates the manifest at `discover()` time against JSON Schema 2020-12. Violations raise `ManifestInvalid` with the offending field and the type of error. Typical failures:
+
+- A required field is missing (`name`, `kind`, `runtime`, ...).
+- Wrong type (`priority = "50"` instead of a number).
+- Invalid enum value (`runtime = "in-process"` with a hyphen instead of `"in_process"`).
+- Semver mismatch (`core_version = "0.1"` instead of a range).
+
+## See also
+
+- [Plugin manifest](../concepts/manifest) — conceptual overview.
+- [Plugin kinds](../concepts/kinds) — where the `kind` value comes from.
+- [Runtimes](../concepts/runtimes) — configuring runtime fields.
+- [Runtime invariants](../concepts/invariants) — what is required of plugins beyond this schema.
+- [ADR-0001](../spec/adr/0001-core) — normative contract for the manifest's base structure.

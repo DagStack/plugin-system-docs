@@ -1,0 +1,242 @@
+---
+sidebar_position: 5
+title: Inter-plugin dependencies
+description: depends_on in the manifest, topological sort during setup, cycles, partial failure when a dependency fails.
+slug: /guides/dependencies
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Inter-plugin dependencies
+
+A plugin can declare that its initialisation depends on other plugins — for example, `order_processor` requires `payment_provider` to already be ready. The registry honours these declarations during the topological sort and initialises plugins in the correct order.
+
+## Manifest declaration
+
+The `depends_on` section of the manifest is a list of plugins that the current plugin depends on. An entry is either a string (`name` only, with `kind` implied) or a table with both `kind` and `name` spelled out.
+
+```toml title="plugins/order_processor/default/dagstack.toml"
+[plugin]
+name = "default"
+kind = "order_processor"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+
+# Short form — name of the dependency plugin only.
+depends_on = ["stripe"]
+
+# Or the long form — when the name is not unique across kinds.
+[[plugin.depends_on]]
+kind = "payment_provider"
+name = "stripe"
+```
+
+## Initialisation order
+
+When `registry.setup_all()` is called:
+
+1. The registry builds a dependency graph from the `depends_on` entries of every registered plugin.
+2. The `topo_sort` topological sort decides the order: if `B` depends on `A`, then `setup(A)` is called before `setup(B)`.
+3. Plugins of the same level (those with no mutual dependency) are initialised in parallel, with a per-plugin timeout `startup_timeout_sec` (30 seconds by default).
+
+The result: by the time `setup(order_processor)` is called the `payment_provider` plugin is already initialised and is reachable through `context.registry`.
+
+## Using a dependency in setup
+
+Inside `setup()` you obtain the dependent plugin via `context.registry`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugins/order_processor/default/plugin.py"
+    from dagstack.plugin_system import PluginContext
+
+
+    class DefaultOrderProcessor:
+        async def setup(self, context: PluginContext) -> None:
+            # payment_provider is guaranteed to be initialised by now.
+            self._payment = context.registry.get_plugin(
+                "payment_provider",
+                name="stripe",
+            )
+
+        async def process(self, order):
+            total = sum(item.price * item.quantity for item in order.items)
+            result = await self._payment.charge(
+                amount_cents=int(total * 100),
+                currency=order.currency,
+                source=order.payment_token,
+            )
+            return {"order_id": order.id, "transaction_id": result.transaction_id}
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { topoSort } from "@dagstack/plugin-system";
+    import type { PluginManifest } from "@dagstack/plugin-system";
+
+    // depends_on declared in the manifest is honoured automatically by
+    // `registry.setupAll()` — it computes a topological order from
+    // `depends_on` references and starts plugins parent-first. On a cycle
+    // the registry throws DependencyCycle; on a reference to an unregistered
+    // plugin — MissingDependency.
+    //
+    // Direct access to the topological order (for advanced cases):
+    const ordered: PluginManifest[] = topoSort(registry.list());
+    for (const m of ordered) {
+      console.log("setup", m.name);
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugins/order_processor/default/plugin.go"
+    package defaultproc
+
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type DefaultOrderProcessor struct {
+        payment PaymentProvider
+    }
+
+    func (p *DefaultOrderProcessor) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        // The kind has a singleton dispatcher; resolve it via a typed dispatcher.
+        disp := pluginsystem.NewDispatchSingleton[PaymentProvider](pluginCtx.Registry, "payment_provider")
+        provider, err := disp.Resolve()
+        if err != nil {
+            return err
+        }
+        p.payment = provider
+        return nil
+    }
+
+    func (p *DefaultOrderProcessor) Process(ctx context.Context, order Order) (ProcessResult, error) {
+        total := computeTotal(order)
+        result, err := p.payment.Charge(ctx, ChargeInput{
+            AmountCents: int(total * 100),
+            Currency:    order.Currency,
+            Source:      order.PaymentToken,
+        })
+        if err != nil {
+            return ProcessResult{}, err
+        }
+        return ProcessResult{OrderID: order.ID, TransactionID: result.TransactionID}, nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Dependency cycles
+
+If `A → B → A` (a direct or transitive cycle) — `setup_all()` raises `DependencyCycle` and reports the full chain. The core does not start.
+
+The typical cycle scenario: two plugins that want to call each other ("A calls B, B calls A"). Break the cycle by:
+
+- **A shared lower-level plugin**: extract the common logic into a third plugin `X`; both depend on `X`.
+- **Deferred lookup**: do not call `registry.get()` inside `setup`; defer it until the first hook invocation (lazy) — the dependency graph then stays empty.
+
+## Partial failure on a failed dependency
+
+If `setup(payment_provider)` fails (an exception or a timeout), `setup_all(ctx)` raises and the whole startup is aborted. The current `0.1.0-rc.2` registry keeps fail-fast semantics — plugins are not partially started.
+
+:::info Phase 2 scope
+The "continue-on-failure" mode (`unavailable_plugins()`, recursive marking of dependents, degraded-mode startup) is on the Phase 2 roadmap. Until then applications inspect the exception raised by `setup_all(ctx)` and decide whether to proceed.
+:::
+
+## Priority vs dependencies
+
+`priority` and `depends_on` are **two different axes**:
+
+- `depends_on` is a hard dependency: B cannot initialise before A.
+- `priority` is the order inside a single topological group (plugins with no mutual dependencies) plus a tiebreaker for singleton/capability dispatch.
+
+In most cases use `depends_on` whenever there is a real dependency in `setup`. `priority` is only for controlling the order of calls in broadcast/chain dispatch.
+
+## Inspecting the dependency graph locally
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import PluginRegistry
+
+    registry = PluginRegistry()
+    registry.discover("plugins/")
+    for manifest in registry.list_manifests():
+        deps = ", ".join(manifest.depends_on) or "(none)"
+        print(f"{manifest.name:30s} depends on: {deps}")
+    ```
+
+    ```
+    stripe                         depends on: (none)
+    tax_calculator                 depends on: (none)
+    order_processor                depends on: stripe
+    invoice_generator              depends on: order_processor, tax_calculator
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { topoSort } from "@dagstack/plugin-system";
+    import type { PluginManifest } from "@dagstack/plugin-system";
+
+    // depends_on declared in the manifest is honoured automatically by
+    // `registry.setupAll()` — it computes a topological order from
+    // `depends_on` references and starts plugins parent-first. On a cycle
+    // the registry throws DependencyCycle; on a reference to an unregistered
+    // plugin — MissingDependency.
+    //
+    // Direct access to the topological order (for advanced cases):
+    const ordered: PluginManifest[] = topoSort(registry.list());
+    for (const m of ordered) {
+      console.log("setup", m.name);
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "fmt"
+        "strings"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        return err
+    }
+    for _, entry := range entries {
+        names := make([]string, 0, len(entry.Manifest.DependsOn))
+        for _, dep := range entry.Manifest.DependsOn {
+            names = append(names, dep.Name)
+        }
+        deps := strings.Join(names, ", ")
+        if deps == "" {
+            deps = "(none)"
+        }
+        fmt.Printf("%-30s depends on: %s\n", entry.Manifest.Name, deps)
+    }
+    ```
+
+    :::info Topological order is computed inside `SetupAll`
+    The Go binding does not export a standalone `TopoSort` helper; the registry computes the topological order during `SetupAll`. To inspect dependencies before setup, walk `Manifest.DependsOn` directly as shown above.
+    :::
+  </TabItem>
+</Tabs>
+
+## Troubleshooting
+
+| Symptom | Likely cause |
+|---|---|
+| `DependencyCycle: A → B → A` at startup | A direct or transitive cycle in `depends_on`. |
+| `Plugin X unavailable: dependency Y failed` | `Y` fell in `setup()` or exceeded `startup_timeout_sec`. Inspect the logs of `Y`. |
+| `KindUnknown: payment_provider` in `setup()` of order_processor | `depends_on` lists `payment_provider`, but no such plugin is in the registry. |
+| `AmbiguousPlugin: embedder` | The registry holds two plugins of kind `embedder` and the choice is ambiguous. Pass `name=` to `registry.get_plugin()` explicitly. |
+
+## See also
+
+- [Plugin lifecycle](./lifecycle) — the `setup`/`teardown` phases in detail.
+- [ADR-0002: Hook invocation semantics](../spec/adr/0002-hook-invocation) — the formal topo-sort algorithm.
+- [Plugin registry](../concepts/registry) — error handling, partial failure.

@@ -1,0 +1,316 @@
+---
+sidebar_position: 2
+title: ADR-0002 · Семантика вызова хуков
+description: Пять классов диспетчеризации — singleton / broadcast-collect / broadcast-notify / chain / capability — их нормативное поведение, порядок исполнения, обработка ошибок, lifecycle-ordering.
+slug: /spec/adr/0002-hook-invocation
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0002 · Семантика вызова хуков
+
+**Статус**: accepted v1.0 (2026-04-16) · [Полный нормативный текст](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0002-hook-invocation-semantics.md)
+
+## Зачем нужны классы диспетчеризации
+
+Базовая LIFO-семантика любого hook-диспетчера — «вызвать все зарегистрированные реализации хука, собрать результаты в список» — покрывает меньшую часть реальных сценариев. На практике нужны разные режимы:
+
+- **Backend connector** — один активный плагин вида (текущий источник истины для данных), не все подряд.
+- **Tool catalog** — полный список всех инструментов, если хоть один сломан — ломается весь каталог.
+- **Domain event** — «кому интересно, пусть узнает» — fire-and-forget, падение одного подписчика никого не волнует.
+- **Middleware** — последовательная цепочка, выход плагина N становится входом плагина N+1.
+- **Format-specific handler** — несколько плагинов вида, каждый обрабатывает свой тип входа; запрос уходит ровно к одному подходящему.
+
+ADR-0002 нормативно фиксирует **пять классов диспетчеризации** и порядок lifecycle-вызовов. Каждый `kind` плагина в своём hookspec объявляет один из пяти классов — и binding обязан реализовать его точно.
+
+## Пять классов
+
+### 1. `singleton` — один активный плагин
+
+Один плагин обрабатывает весь вид. Алгоритм выбора активного плагина:
+
+1. Если у приложения-потребителя задана **явная routing-policy** (например, per-tenant группа или blue/green split) — используется она.
+2. Иначе — глобальный override через переменную окружения `DAGSTACK_ACTIVE_<KIND>=<plugin_name>`.
+3. Иначе — сортировка кандидатов по `priority desc`, выбирается с максимальным.
+4. При равном `priority` без override — `AmbiguousPlugin`, ядро не стартует.
+
+**Возврат**: первый непустой результат. Если все вернули пусто — `KindUnknown` / `NoCapableHandler`.
+
+**Применение**: backend connectors, оркестраторы, любые виды с «один активный».
+
+### 2. `broadcast_collect` — все, с агрегацией
+
+Все активные плагины вида вызываются. Результаты собираются в **массив** в порядке `priority desc`, при равном — по имени.
+
+**Error policy — fail-fast по умолчанию**: падение одного плагина ломает весь collect, вызывающий код получает ошибку, плагин помечается `degraded`. Для конкретного вида можно переопределить на `best_effort` в hookspec-метаданных — тогда падения пропускаются, частичный результат возвращается.
+
+**Применение**: каталоги инструментов, экспортёры метрик, провайдеры capabilities.
+
+### 3. `broadcast_notify` — fire-and-forget
+
+Все плагины уведомляются параллельно. Возвращаемые значения **не собираются**. Падение отдельного плагина логируется как `plugin=X error=...`, не пропагируется наверх.
+
+**Возврат**: void / None.
+
+**Применение**: lifecycle-события (`on_started`, `on_request`, `on_error`), telemetry-события, audit-hooks.
+
+### 4. `chain` — последовательная цепочка
+
+`output[N]` передаётся как `input[N+1]`. Строгий линейный порядок по `priority desc`. Прерывание цепочки — возврат kind-специфичного sentinel (например, `STOP_CHAIN` в Python-реализации) или выброс исключения.
+
+**Ограничение**: chain-хуки обязаны быть **RPC-safe** (возможность исполнения через MCP). Потоки, сложные циклические объекты — не поддерживаются; контрактный тест это проверяет.
+
+**Применение**: middleware (переписывание запроса, пост-обработка, re-ranking результатов поиска).
+
+### 5. `capability` — диспетчер по возможности
+
+Несколько плагинов вида, каждый умеет обрабатывать определённое подмножество входов. Ровно **один** подходящий плагин получает запрос (в отличие от `singleton`, где один плагин знает весь вид; и от `broadcast_*`, где вызываются все).
+
+**Декларация возможностей в манифесте**:
+
+```toml
+[plugin]
+kind = "file_processor"
+name = "format-a-handler"
+supports_languages = ["format-a"]
+supports_extensions = [".fmta"]
+supports_mime_types = ["application/x-format-a"]
+priority = 60
+fallback = false   # ровно один плагин вида может иметь fallback=true
+```
+
+**Алгоритм**:
+
+1. Фильтр кандидатов: все плагины вида, у которых хотя бы одна `supports_*` запись матчится с входом.
+2. Если кандидатов нет — ищется плагин с `fallback = true`; если его нет — `DispatchError` (эквивалент HTTP 422).
+3. При нескольких кандидатах — сортировка по `priority desc`, при равных — по имени.
+4. Возвращается первый.
+
+Индекс `capability → plugin` строится реестром один раз при старте; выбор плагина — O(1) lookup.
+
+**Контракт fallback-плагина**: **должен** корректно обрабатывать любой валидный вход своего вида без исключений. Все пограничные случаи (пустой вход, битый UTF-8, бинарные данные, большой размер, permission denied) — обрабатываются gracefully, возвращая `[]` или skip-сигнал. Иначе не-матчащий вход роняет всю цепочку обработки. Базовая контрактная рамка тестов автоматически проверяет fallback на наборе curated edge-case входов.
+
+### Сравнение singleton vs capability
+
+| | `singleton` | `capability` |
+|---|---|---|
+| Что знает плагин | весь вид (все входы) | только подмножество (своя capability) |
+| Активный выбор | один на весь вид | разные для разных входов |
+| Новая реализация | заменяет всю логику вида | добавляется без конфликта |
+| Типичный вид | backend connector, оркестратор | file processor, format-specific handler |
+
+## Пример: один `kind` с разными классами
+
+Ниже — один и тот же вид плагина (`embedder` — создаёт векторные представления текста) декларируется в разных классах диспетчеризации в зависимости от сценария.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="Singleton — one active embedder per application"
+    # The kind's dispatch_class is declared in the hookspec, not in the manifest.
+    embedder = registry.get_plugin("embedder", name="openai_compatible")
+    vectors = embedder.embed(texts=["hello", "world"])
+    ```
+
+    ```python title="Broadcast-collect — gather from every available model"
+    from dagstack.plugin_system import BroadcastCollectDispatcher
+
+    dispatcher = BroadcastCollectDispatcher(registry)
+    # The dispatch class for the hook is provided per call (kind, hook_name).
+    results, errors = dispatcher.dispatch(
+        "metric_exporter", "on_request_finished", ctx, duration_ms=42,
+    )
+    if errors is not None:
+        for plugin_name, exc in errors.errors:
+            ctx.logger.warning("metric exporter %s failed: %s", plugin_name, exc)
+    # results = [from prometheus_exporter, from statsd_exporter, from log_exporter]
+    ```
+
+    ```python title="Capability — pick an embedder for a specific language"
+    from dagstack.plugin_system import CapabilityDispatcher
+
+    # In the manifest: supports_languages = ["python", "typescript"]
+    dispatcher = CapabilityDispatcher(registry)
+    vectors = dispatcher.dispatch(
+        "embedder", "embed", ctx,
+        input={"language": "python", "text": "..."},
+    )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="Singleton — one active embedder per kind"
+    // The dispatcher narrows the resolved plugin to the domain interface so
+    // call sites do not type-assert on every invocation.
+    embedderDispatch := pluginsystem.NewDispatchSingleton[Embedder](reg, "embedder")
+    embedder, err := embedderDispatch.Resolve()
+    if err != nil { return err }
+    vectors, err := embedder.Embed(ctx, []string{"hello", "world"})
+    ```
+
+    ```go title="Broadcast-collect — gather from every available exporter"
+    exporters := pluginsystem.NewDispatchBroadcastCollect(reg, "metric_exporter")
+
+    // The handler is the actual hook call site — extract the typed method on
+    // each plugin instance and invoke it. Errors are captured per plugin in
+    // CollectResult.Err; the loop is not aborted by an individual failure.
+    results := exporters.Dispatch(ctx, func(ctx context.Context, p pluginsystem.Plugin) (any, error) {
+        exp, ok := p.Unwrap().(MetricExporter)
+        if !ok {
+            return nil, fmt.Errorf("plugin does not satisfy MetricExporter")
+        }
+        return exp.OnRequestFinished(ctx, RequestEvent{DurationMs: 42})
+    })
+    for _, r := range results {
+        if r.Err != nil {
+            slog.Warn("metric exporter failed", "plugin", r.PluginName, "err", r.Err)
+        }
+    }
+    ```
+
+    ```go title="Capability — pick an embedder for a specific language"
+    // Each plugin participates by implementing pluginsystem.MatchPlugin so its
+    // Matches(ctx, args...) bool method declares which inputs it claims.
+    embedderCap := pluginsystem.NewDispatchCapability(reg, "embedder")
+    plugin, err := embedderCap.Resolve(func(p pluginsystem.Plugin) bool {
+        m, ok := p.(pluginsystem.MatchPlugin)
+        return ok && m.Matches(pluginCtx, "language", "python")
+    })
+    if err != nil {
+        // errors.Is(err, pluginsystem.ErrNoCapabilityMatch) — no plugin matched.
+        return err
+    }
+    vectors, _ := plugin.Unwrap().(Embedder).Embed(ctx, texts)
+    ```
+  </TabItem>
+</Tabs>
+
+## Когда какой класс выбирать
+
+| Ситуация | Класс |
+|---|---|
+| Один активный «бэкенд» на вид | `singleton` |
+| Собрать список/каталог от всех (tools, metrics) | `broadcast_collect` |
+| Событие с N независимыми подписчиками | `broadcast_notify` |
+| Middleware с трансформацией данных | `chain` |
+| Реализации специализированы по типу входа (расширение, язык, MIME) | `capability` |
+
+## Порядок lifecycle-вызовов
+
+Методы жизненного цикла (`setup`, `teardown`, `health`) вызываются напрямую на экземплярах плагинов, не через диспетчер. У них свой нормативный порядок.
+
+### Порядок setup
+
+1. **По runtime**: `in_process` → `mcp_stdio` → `mcp_http`. Быстрые и надёжные — первыми; сетевые — последними, чтобы их таймауты не блокировали остальных.
+2. **Топологическая сортировка** по `depends_on` в манифесте.
+3. При равных зависимостях — по `priority desc`, затем по имени.
+4. В пределах одной топологической группы — параллельно, с per-plugin `startup_timeout` (по умолчанию 30 секунд).
+
+### Partial failure — continue, не fail-fast
+
+Если `setup` плагина упал или превысил timeout:
+
+- плагин помечается `unavailable` с указанием причины;
+- **рекурсивно** помечаются `unavailable` все, у кого в `depends_on` есть упавший;
+- остальные группы продолжают setup;
+- ядро стартует в деградировавшем режиме, список `unavailable` доступен через административный API;
+- fast-fail всей группы на одном упавшем нестабилен в распределённых сценариях (особенно `mcp_http`); continue-on-failure прагматичнее для production.
+
+### Порядок teardown
+
+- **Обратный** setup: плагин, от которого зависят, останавливается последним.
+- Per-plugin `teardown_timeout` (по умолчанию 15 секунд).
+- Если teardown не уложился: операция отменяется, плагин помечается `leaked`, shutdown ядра продолжается. Для `mcp_*`-runtime — `SIGTERM` → 5с → `SIGKILL`. Leaked-плагины блокируют hot-reload до перезапуска ядра.
+
+### Health-check
+
+Параллельно, независимо, периодически (по умолчанию 30 секунд на плагин). Падение переводит плагин в `degraded` с retry. Несколько падений подряд — `unavailable` + alert.
+
+## Дополнения в манифест
+
+ADR-0002 расширяет схему манифеста из ADR-0001:
+
+```toml
+[plugin]
+# ... базовые поля ADR-0001 ...
+
+priority = 50                                # 0-100, default 0. Больше = раньше/важнее.
+depends_on = ["plugin-a", "plugin-b"]        # имена плагинов
+tryfirst = false                             # форсированно первым (отладка/override)
+trylast = false                              # форсированно последним (cleanup)
+startup_timeout_sec = 30
+teardown_timeout_sec = 15
+
+# Поля для capability-dispatch:
+supports_languages = []
+supports_extensions = []
+supports_mime_types = []
+fallback = false
+```
+
+`tryfirst` / `trylast` — escape-hatches для отладки и ручного override, не замена `priority` + `depends_on` в production. Одновременное `tryfirst=true` и `trylast=true` — ошибка валидации манифеста.
+
+## priority vs consumer routing-policies
+
+Это **две разных оси**, которые не конкурируют:
+
+- **`priority` в манифесте** — для lifecycle-ordering (setup/shutdown/broadcast order) и tie-break в `singleton` / `capability`, когда ни явный override, ни routing-policy не применимы.
+- **Routing-policies приложения** (per-tenant группы, blue/green, canary) — **перекрывают** `priority` для runtime-выбора в `singleton` / `capability`, когда соответствующий контекст активен.
+
+Если для вида активна routing-policy, `priority` из манифеста **не участвует** в runtime-выборе.
+
+## Разрешение конфликтов
+
+| Конфликт | Поведение |
+|---|---|
+| `singleton` ambiguity (равный priority, нет override, нет routing) | `AmbiguousPlugin` — ядро не стартует. Ошибка указывает env-переменную для разрешения. |
+| Цикл зависимостей (A → B → A) | `DependencyCycle` — ядро не стартует. |
+| `depends_on` отсутствующего плагина | Зависящий плагин помечается `unavailable`; остальная система работает. |
+| Два `fallback = true` на один вид | `AmbiguousPlugin` — ядро не стартует. |
+
+## Последствия
+
+**Положительные:**
+
+- Один `kind` может эволюционировать от `singleton` (единственная реализация) к `capability` (несколько специализированных) без breaking change: существующая реализация объявляет все свои capabilities явно и становится fallback.
+- Lifecycle-ordering нормативен — поведение в пограничных случаях (failed dependencies, timeouts) предсказуемо на всех реализациях.
+- `priority` и `routing-policy` не конкурируют — приложение может держать статичный `priority` в манифестах и одновременно динамически переключать активных плагинов через policy.
+
+**Компромиссы:**
+
+- Классы диспетчеризации нельзя смешивать внутри одного вида — вид выбирает ровно один класс. Для смешанных сценариев («собрать со всех, но с fallback если никто не ответил») нужно декомпозировать на два вида.
+- Continue-on-failure для setup делает отладку сложнее: пропущенный плагин может остаться незамеченным до первого обращения. Смягчается admin API с перечислением `unavailable` плагинов, обязательным для production-setup.
+
+**Что запрещено этим ADR:**
+
+- Binding не может молча менять семантику класса (например, `broadcast_collect` в fire-and-forget): классы закрытый enum в `_meta/dispatch_classes.yaml`.
+- Два плагина с `fallback = true` в одном виде — ядро обязано отказаться стартовать, не выбирать «случайного».
+
+## Связанные ADR
+
+- [ADR-0001](./0001-core) — концепция `PluginRegistry`, на которой диспетчеры работают.
+- [ADR-0003](./0003-runtime-invariants) — lifecycle-ordering совместим с runtime-инвариантами.
+- [ADR-0004](./0004-hookspec) — `dispatch_class` — поле в hookspec-YAML, эмитируется в типы реализаций.
+- [ADR-0005](./0005-horizontal-hooks) — middleware-слой на базе `ChainDispatcher` с `MIDDLEWARE_PRIORITY_THRESHOLD`.
+
+## Нормативный источник
+
+Полный текст ADR-0002 с формулой error-policy, контрактными требованиями к fallback-плагинам и таблицей binding-specific правил: [`plugin-system-spec/adr/0002-hook-invocation-semantics.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0002-hook-invocation-semantics.md).
+
+Закрытый enum классов — в файле [`_meta/dispatch_classes.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta).

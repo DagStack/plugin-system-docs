@@ -1,0 +1,102 @@
+{
+  "version.label": {
+    "message": "Next",
+    "description": "The label for version current"
+  },
+  "sidebar.mainSidebar.category.Concepts": {
+    "message": "Понятия",
+    "description": "The label for category 'Concepts' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Concepts.link.generated-index.title": {
+    "message": "Понятия",
+    "description": "The generated-index page title for category 'Concepts' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Concepts.link.generated-index.description": {
+    "message": "Ключевые объекты предметной области — реестр, манифест, обнаружение, диспетчеризация.",
+    "description": "The generated-index page description for category 'Concepts' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Guides": {
+    "message": "Руководства",
+    "description": "The label for category 'Guides' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Guides.link.generated-index.title": {
+    "message": "Руководства",
+    "description": "The generated-index page title for category 'Guides' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Guides.link.generated-index.description": {
+    "message": "Практические задачи — написание плагинов, конфигурация, жизненный цикл, тестирование.",
+    "description": "The generated-index page description for category 'Guides' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Dispatch classes": {
+    "message": "Классы диспетчеризации",
+    "description": "The label for category 'Dispatch classes' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Dispatch classes.link.generated-index.title": {
+    "message": "Классы диспетчеризации — end-to-end",
+    "description": "The generated-index page title for category 'Dispatch classes' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Dispatch classes.link.generated-index.description": {
+    "message": "По странице на каждый из пяти классов: полный walkthrough — hookspec вида + несколько плагинов + вызов диспетчера + типичные ошибки.",
+    "description": "The generated-index page description for category 'Dispatch classes' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Specification": {
+    "message": "Спецификация",
+    "description": "The label for category 'Specification' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Specification.link.generated-index.title": {
+    "message": "Спецификация",
+    "description": "The generated-index page title for category 'Specification' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Specification.link.generated-index.description": {
+    "message": "Нормативные решения архитектуры `dagstack/plugin-system` — как взаимодействует каждая часть, какие инварианты поддерживаются, как эмитируются контракты. Резюме на русском; формальный нормативный текст ADR — в spec-репозитории, ссылки даны в каждой странице.",
+    "description": "The generated-index page description for category 'Specification' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.ADR": {
+    "message": "ADR",
+    "description": "The label for category 'ADR' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.ADR.link.generated-index.title": {
+    "message": "ADR (Architecture Decision Records)",
+    "description": "The generated-index page title for category 'ADR' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.ADR.link.generated-index.description": {
+    "message": "Шесть ADR, фиксирующих архитектурные решения `dagstack/plugin-system`. На каждой странице — русскоязычное резюме ключевых решений, пример на Python/TypeScript/Go и ссылка на полный нормативный ADR в spec-репо.",
+    "description": "The generated-index page description for category 'ADR' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Format reference": {
+    "message": "Справочник форматов",
+    "description": "The label for category 'Format reference' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Format reference.link.generated-index.title": {
+    "message": "Справочник форматов",
+    "description": "The generated-index page title for category 'Format reference' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Format reference.link.generated-index.description": {
+    "message": "Точные таблицы всех полей манифеста, встроенных видов, runtime-адаптеров и классов ошибок — для быстрого поиска во время написания плагина или ревью.",
+    "description": "The generated-index page description for category 'Format reference' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.API reference": {
+    "message": "Справочник API",
+    "description": "The label for category 'API reference' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.API reference.link.generated-index.title": {
+    "message": "Справочник API",
+    "description": "The generated-index page title for category 'API reference' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.API reference.link.generated-index.description": {
+    "message": "Авто-генерируемая справка по публичному API для каждой из языковых реализаций.",
+    "description": "The generated-index page description for category 'API reference' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Python": {
+    "message": "Python",
+    "description": "The label for category 'Python' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Python.link.generated-index.title": {
+    "message": "API Python",
+    "description": "The generated-index page title for category 'Python' in sidebar 'mainSidebar'"
+  },
+  "sidebar.mainSidebar.category.Python.link.generated-index.description": {
+    "message": "Автоматически сгенерированный справочник публичного API пакета dagstack-plugin-system.",
+    "description": "The generated-index page description for category 'Python' in sidebar 'mainSidebar'"
+  }
+}

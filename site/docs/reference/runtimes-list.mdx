@@ -1,0 +1,154 @@
+---
+sidebar_position: 3
+title: Runtimes
+description: Three runtime adapters — in_process / mcp_stdio / mcp_http. Full table of properties, constraints, and runtime-specific manifest fields.
+slug: /reference/runtimes-list
+---
+
+# Runtimes — reference
+
+In v1.0 the spec repository normatively fixes three runtime adapters. Every binding must implement all three.
+
+## Property table
+
+| Property | `in_process` | `mcp_stdio` | `mcp_http` |
+|---|---|---|---|
+| Where the plugin runs | In the same process as the host | In a separate subprocess, communicating via stdin/stdout | In a separate host, communicating via HTTP |
+| Cross-language | Host language only | Any language (via the MCP protocol) | Any language |
+| Serialisation | Not required (native objects) | JSON (line-delimited) | JSON (HTTP body) |
+| Call latency | Nanoseconds / microseconds | Tens of microseconds | Milliseconds (network) |
+| Isolation from the host process | None | Yes (separate process) | Yes (separate host) |
+| Transient errors | Impossible | Impossible | Possible (network, timeout) |
+| Deploy independent of the host | No | Yes (subprocess with its own version) | Yes |
+| Streaming support | Yes (native iterator) | Limited (line-delimited) | Limited (SSE / WebSocket) |
+| Requires MCP handshake | No | Yes | Yes |
+| Retry on call failure | Application's responsibility | Core may retry with backoff | Core may retry with backoff |
+| Suitable for hot paths with strict latency requirements | Yes | No (serialise + IPC) | No (serialise + network) |
+
+## `in_process`
+
+### Runtime-specific manifest fields
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `entry_point` | `string` | Yes | `"module:ClassName"`. The module is loaded via `importlib.util.spec_from_file_location` (for Python) or its equivalent. |
+
+### Example
+
+```toml
+[plugin]
+runtime = "in_process"
+entry_point = "plugin:OpenAIPlugin"
+```
+
+### Plugin code contract
+
+- The plugin is a class implementing the protocol of its `kind` (derived from the hookspec).
+- `setup(ctx)` and `teardown()` are ordinary class methods.
+- Runtime invariants 1–8 must hold (see [Runtime invariants](../concepts/invariants)).
+- Runtime invariant 2 (serialisability) is recommended, not required (the plugin may pass native objects within the host).
+
+## `mcp_stdio`
+
+MCP = Model Context Protocol. JSON-RPC 2.0 over line-delimited JSON on the subprocess's stdin/stdout.
+
+### Runtime-specific manifest fields
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `command` | `string[]` | Yes | — | Launch command. The first element is the executable; the rest are arguments. |
+| `working_dir` | `string` | No | host cwd | Subprocess working directory. |
+| `env` | `object` | No | `{}` | Environment variables. The host adds these on top of its own. |
+| `startup_timeout_sec` | `int` | No | `30` | Initial MCP handshake timeout. |
+
+### Example
+
+```toml
+[plugin]
+runtime = "mcp_stdio"
+
+[plugin.mcp_stdio]
+command = ["python", "-m", "my_plugin.server"]
+startup_timeout_sec = 45
+env = { PYTHONUNBUFFERED = "1" }
+```
+
+### Plugin code contract
+
+- The plugin is any executable that implements the MCP protocol: it reads requests from stdin and writes responses to stdout.
+- Tooling: `mcp-sdk` for Python / TypeScript / Go.
+- Every hook input and output must be **JSON-serialisable**.
+- The plugin may crash without affecting the host process; the host restarts the subprocess as needed.
+
+## `mcp_http`
+
+JSON-RPC 2.0 over HTTP (POST with a JSON body).
+
+### Runtime-specific manifest fields
+
+| Field | Type | Required | Default | Description |
+|---|---|---|---|---|
+| `url` | `string` | Yes | — | Base URL of the MCP service (no trailing slash). |
+| `auth_header` | `string` | No | — | HTTP header name for the bearer token. |
+| `auth_secret_env` | `string` | No | — | Name of the env variable from which the host reads the secret value. |
+| `timeout_sec` | `int` | No | `60` | Per-request HTTP timeout. |
+| `tls_ca_bundle` | `string` | No | system CA | Path to a CA bundle (for corporate self-signed certificates). |
+| `tls_verify` | `bool` | No | `true` | Whether to verify the server certificate. `false` is permitted **only** in dev — forbidden in production. |
+
+### Example
+
+```toml
+[plugin]
+runtime = "mcp_http"
+
+[plugin.mcp_http]
+url = "https://plugins.example.com/tool/v1"
+auth_header = "X-API-Token"
+auth_secret_env = "EXAMPLE_API_TOKEN"
+timeout_sec = 120
+tls_ca_bundle = "/etc/ssl/certs/corp-ca.pem"
+```
+
+### Plugin code contract
+
+- The plugin is an HTTP service available at the given URL and implementing MCP.
+- All `mcp_stdio` requirements apply, plus its own: certificate validation, network-error handling, server-side rate limiting.
+- The host retries transient errors (5xx, connection reset) with exponential backoff.
+
+## Multiple runtimes in a single plugin
+
+A plugin may declare several runtime adapters:
+
+```toml
+runtime = ["in_process", "mcp_stdio"]
+
+[plugin.mcp_stdio]
+command = ["python", "-m", "my_plugin.server"]
+```
+
+The host picks a runtime at load time. Typical scenarios:
+
+- **Python host, Python plugin** — `in_process` is chosen for performance.
+- **TypeScript host, Python plugin** — `mcp_stdio` is chosen (TypeScript cannot import Python modules).
+- **Heterogeneous deploy** — `mcp_http` is chosen if the plugin is already deployed as a SaaS.
+
+If the host supports none of the listed runtime adapters, the plugin is marked `RuntimeNotSupported`.
+
+## Choosing a runtime adapter — flowchart
+
+```
+Plugin in the same language as the host?
+├── Yes:
+│   ├── Need isolation? ─── No, performance matters ────── in_process
+│   └─────────────────── Yes, untrusted code ──────────── mcp_stdio
+└── No:
+    ├── Plugin is an external service (SaaS, microservice) ── mcp_http
+    └── Local plugin in another language ──────────────────── mcp_stdio
+```
+
+## See also
+
+- [Runtimes](../concepts/runtimes) — conceptual overview.
+- [Plugin manifest](./manifest-schema) — full manifest schema.
+- [ADR-0001](../spec/adr/0001-core) — normative contract for runtime adapters.
+- [ADR-0003: Orchestration-neutral runtime](../spec/adr/0003-runtime-invariants) — the 8 invariants required across all runtime adapters.

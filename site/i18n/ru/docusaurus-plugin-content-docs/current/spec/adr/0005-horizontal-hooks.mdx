@@ -1,0 +1,333 @@
+---
+sidebar_position: 5
+title: ADR-0005 · Горизонтальные расширения
+description: Пять точек расширения plugin-system для governance / quota / observability — открытый слот metadata, chain-middleware, decoration ресурсов, capability-filtering, распространение trace-context.
+slug: /spec/adr/0005-horizontal-hooks
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0005 · Горизонтальные расширения
+
+**Статус**: accepted v1.0 (2026-04-16) · [Полный нормативный текст](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0005-extensibility-hooks-for-horizontal-concerns.md)
+
+## Зачем отдельный ADR про сквозные аспекты
+
+dagstack — зонтичный бренд для AI/ML-инфраструктуры. Plugin-system — нижний слой; поверх него запланированы продукты-надстройки:
+
+- **governance / iam** — разрешения для каждой тройки `(tenant, plugin, action)`, audit logs.
+- **quota / metering** — учёт потребления (tokens LLM, vector-DB writes, объёма хранилища) per tenant, контроль лимитов.
+- **observability** — единые traces / metrics / structured logs поверх всех плагинов и оркестраторов.
+- **tenancy** — мульти-клиентный scoping ресурсов.
+
+Эти продукты живут в отдельных spec-репозиториях и bindings, но встраиваются в plugin-system как middleware-плагины или декораторы ресурсов. **Проблема**: если plugin-system ядро про tenant/actor/quota ничего не знает, добавлять их потом = breaking change во всех hookspecs (надо прокидывать tenant context аргументом в каждый хук).
+
+ADR-0005 фиксирует **пять extension points**, через которые горизонтальные продукты встраиваются в plugin-system **без модификации core**. Это даёт надстройкам возможность разрабатываться параллельно с plugin-system, не блокируя друг друга.
+
+**Этот ADR НЕ определяет**: модель tenancy, permission-модель IAM, модель quota, observability-backends, схему audit-логов — каждая из них живёт в спецификации продукта и решается там.
+
+## Пять точек расширения
+
+### 1. `PluginContext.metadata` — открытый слот ключ-значение
+
+`PluginContext` (из [ADR-0001](./0001-core)) обязан содержать поле:
+
+| Поле | Тип | Семантика |
+|---|---|---|
+| `metadata` | иммутабельный `Mapping<string, any>` | Открытый слот ключ-значение для сквозных аспектов. Plugin-system core **не интерпретирует** ключи — читает и пишет туда middleware. |
+
+**Канонические ключи** (закреплены за горизонтальными продуктами):
+
+| Ключ | Кто пишет | Кто читает | Назначение |
+|---|---|---|---|
+| `tenant_id` | governance-middleware | I/O-плагины, ресурсы | Tenant-scope текущего вызова. |
+| `actor` | iam-middleware | governance-middleware, audit | Subject identity (user/service). |
+| `quota_budget` | quota-middleware | I/O-плагины (опционально) | Оставшийся budget per `(tenant, resource_type)`. |
+| `trace_context` | observability-middleware | I/O-плагины, ресурсы | W3C Trace Context (`traceparent` + `tracestate`). |
+| `request_id` | host runtime | все | Корреляция в логах. |
+
+Список **открытый**: новые ключи добавляются через ADR в spec-репо соответствующего горизонтального продукта, не в plugin-system.
+
+**Ограничения**:
+
+- `metadata` обязан быть **сериализуемым** (для cross-runtime-проброса через `mcp_stdio` / `mcp_http`). Не складывать туда сложные объекты с методами или ссылками на host-state.
+- **Автор плагина не полагается на наличие конкретных ключей**. Если ключа нет — плагин работает без feature, не падает.
+
+### 2. Chain dispatch как канонический middleware-механизм
+
+[ADR-0002](./0002-hook-invocation) §4 уже фиксирует класс диспетчеризации `chain`: `output[N]` становится `input[N+1]`, строгий порядок по `priority desc`. ADR-0005 **канонизирует** `chain` как основной механизм для горизонтальных middleware.
+
+Пример «governance + quota как chain-middleware вокруг обычного tool-плагина»:
+
+```
+hookspec: tool.execute (singleton)
+  ↓
+governance-plugin (chain, priority=1000):
+  • читает ctx.metadata["tenant_id"], ctx.metadata["actor"]
+  • проверяет permission(actor, tool=name, action="execute")
+  • deny → throw PermissionDenied (прерывание цепочки)
+  • allow → передаёт input дальше без изменений
+  ↓
+quota-plugin (chain, priority=500):
+  • проверяет ctx.metadata["quota_budget"][tool.kind]
+  • budget == 0 → throw QuotaExceeded
+  • передаёт input дальше
+  ↓
+target tool plugin (singleton, priority=0):
+  • выполняет execute
+  ↓
+quota-plugin post-hook:
+  • инкрементирует usage по результату
+  ↓
+governance-plugin post-hook:
+  • пишет audit log
+```
+
+**Дополнения этим ADR поверх ADR-0002**:
+
+- Plugin-system ядро обязано поддерживать chain-wrapping для **любого** класса диспетчеризации, не только для хуков, явно объявивших `chain` в hookspec. То есть governance-плагин может встроиться **в каждый хук** через priority-based chain layer, который ядро применяет автоматически.
+- Диапазон `priority` `[1000, ∞)` **зарезервирован** за горизонтальными middleware. Автор плагина не использует этот диапазон для бизнес-плагинов. Контрактный тест проверяет.
+
+### 3. Decoration ресурсов
+
+[ADR-0003](./0003-runtime-invariants) §3 фиксирует Resources DI: HTTP-клиенты, БД-клиенты, blob-store инъектируются хостом через `PluginContext.resources`. ADR-0005 добавляет инвариант:
+
+> Ресурсы **обязаны** поддерживать **decoration** через wrapping: host-runtime или middleware-плагин может вернуть proxy-объект, реализующий тот же интерфейс, делегирующий вызовы оригиналу, и добавляющий сквозную логику (metering, rate-limiting, audit).
+
+Пример «quota как декоратор ресурса»:
+
+```
+manifest: tool requires resources = ["llm_client", "vector_store"]
+  ↓
+host runtime собирает ресурсы:
+  llm_client = OriginalLLMClient(...)
+  vector_store = OriginalVectorStore(...)
+  ↓
+quota-middleware при resolve запрашивает у реестра decorators:
+  llm_client = QuotaTracker(llm_client, budget=ctx.metadata["quota_budget"]["tokens"])
+  vector_store = QuotaTracker(vector_store, budget=ctx.metadata["quota_budget"]["vector_writes"])
+  ↓
+plugin вызывает llm_client.chat(...):
+  QuotaTracker.chat() инкрементирует счётчик до пробрасывания вызова
+  в OriginalLLMClient.chat()
+```
+
+**Ограничение**: интерфейс ресурса **обязан** быть формально специфицирован (Protocol / interface), иначе decoration ломает type-safety. Каждый вид плагина, объявляющий ресурс, обязан публиковать его интерфейс в спецификации.
+
+### 4. Governance-driven filtering через capability-dispatch
+
+[ADR-0002](./0002-hook-invocation) §5 фиксирует `capability` dispatch: один запрос роутится на один плагин с подходящей декларацией capability. ADR-0005 добавляет use-case:
+
+> Host runtime **может** ограничить набор допустимых плагинов для конкретного вызова на основе `ctx.metadata["tenant_id"]` (или другого governance-ключа). Результирующее множество = capability-declarations всех плагинов вида ∩ governance policy. Из него capability-dispatch выбирает финального исполнителя.
+
+Пример «PII-safe routing»:
+
+```
+manifest: tool-plugin-A has capability = ["pii_handling"]
+manifest: tool-plugin-B has capability = []  (не умеет PII)
+
+governance policy:
+  tenant="acme-healthcare" allowed_plugins where capability ⊇ {"pii_handling"}
+  ↓
+host фильтрует реестр → candidates = [tool-plugin-A]
+  ↓
+capability-dispatch выбирает tool-plugin-A по input matcher
+```
+
+Plugin-system ядро **не реализует filtering** само — оно только публикует capability-декларации и принимает filter-callback от хоста. Governance-продукт регистрирует filter через chain-middleware (см. §2).
+
+### 5. Propagation trace-context
+
+[ADR-0003](./0003-runtime-invariants) уже требует пробрасывания W3C Trace Context. ADR-0005 конкретизирует механизм:
+
+- Trace-context живёт в `ctx.metadata["trace_context"]` — строки W3C (`traceparent` + `tracestate`), обязательно сериализуемые.
+- Адаптеры `mcp_stdio` и `mcp_http` **обязаны** пробрасывать trace-context через границу протокола (HTTP-заголовки / JSON-RPC params).
+- Ресурсы **обязаны** принимать `trace_context` через decoration (см. §3) — observability-middleware оборачивает их и дописывает spans.
+- Автор плагина **не вызывает tracer напрямую** — observability-middleware делает spans автоматически вокруг каждого hook-вызова и каждого вызова ресурса.
+
+## Пример: минимальный governance-плагин как chain-middleware
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```toml title="plugins/governance-middleware/dagstack.toml"
+    [plugin]
+    name = "governance"
+    kind = "horizontal_middleware"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+
+    # Priority in the horizontal range — runs ahead of business plugins.
+    priority = 1000
+
+    # Declares that the plugin wants to participate in the chain around every hook of every kind.
+    [plugin.chain_wrap]
+    kinds = ["*"]          # all plugin kinds
+    hooks = ["*"]          # all hooks of each kind
+    ```
+
+    ```python title="plugins/governance-middleware/plugin.py"
+    from dagstack.plugin_system import PluginContext
+
+
+    class PermissionDenied(Exception):
+        """Raised by a governance binding when a policy check rejects the call."""
+
+
+    class GovernanceMiddleware:
+        async def setup(self, context: PluginContext) -> None:
+            self._policy = load_policy()  # from a governance-spec binding
+
+        def before(self, ctx: PluginContext, kind: str, name: str, hook: str, args: dict) -> dict:
+            tenant_id = ctx.metadata.get("tenant_id")
+            actor = ctx.metadata.get("actor")
+            if tenant_id is None or actor is None:
+                # If the governance middleware runs without metadata — silently pass through.
+                return args
+            if not self._policy.allow(actor, tenant_id, kind, name, hook):
+                raise PermissionDenied(
+                    f"actor={actor.id} tenant={tenant_id} kind={kind} hook={hook}",
+                )
+            return args
+
+        def after(self, ctx: PluginContext, kind: str, name: str, hook: str, result: object) -> None:
+            self._audit_log(ctx=ctx, kind=kind, name=name, hook=hook, result=result)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```toml title="plugins/governance-middleware/dagstack.toml"
+    [plugin]
+    name = "governance"
+    kind = "horizontal_middleware"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 1000
+
+    [plugin.chain_wrap]
+    kinds = ["*"]
+    hooks = ["*"]
+    ```
+
+    ```go title="plugins/governance-middleware/plugin.go"
+    package governance
+
+    import (
+        "context"
+        "errors"
+        "fmt"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    // ErrPermissionDenied is returned by the governance middleware when a
+    // policy check rejects the call. The host runtime that wires the chain
+    // surfaces it back to the caller.
+    var ErrPermissionDenied = errors.New("governance: permission denied")
+
+    type GovernanceMiddleware struct {
+        policy Policy
+    }
+
+    func (p *GovernanceMiddleware) Unwrap() any { return p }
+
+    func (p *GovernanceMiddleware) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        p.policy = loadPolicy()
+        return nil
+    }
+
+    // Before is invoked by the host's chain runner ahead of every wrapped
+    // hook. The chain_wrap layer that delivers `kind / name / hook` is part of
+    // the ADR-0005 horizontal-extensions surface — it is not yet implemented
+    // in pluginsystem 0.1.x and lands together with the chain-wrap registry
+    // in Phase 2. Today, plug a chain hook through pluginsystem.DispatchChain
+    // and emulate the surface manually.
+    func (p *GovernanceMiddleware) Before(
+        pluginCtx *pluginsystem.PluginContext,
+        kind, name, hook string,
+        args map[string]any,
+    ) (map[string]any, error) {
+        tenantID, _ := pluginCtx.Metadata["tenant_id"].(string)
+        actor, _ := pluginCtx.Metadata["actor"].(Actor)
+        if tenantID == "" || actor.ID == "" {
+            // Governance middleware running without metadata — silently
+            // pass-through; hosts that require it must enforce earlier.
+            return args, nil
+        }
+        if !p.policy.Allow(actor, tenantID, kind, name, hook) {
+            return nil, fmt.Errorf("%w: actor=%s tenant=%s kind=%s hook=%s",
+                ErrPermissionDenied, actor.ID, tenantID, kind, hook)
+        }
+        return args, nil
+    }
+
+    func (p *GovernanceMiddleware) After(
+        pluginCtx *pluginsystem.PluginContext,
+        kind, name, hook string,
+        result any,
+    ) error {
+        return p.auditLog(pluginCtx, kind, name, hook, result)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Плагин включается в цепочку всех хуков автоматически через `chain_wrap` — бизнес-плагины не знают о его существовании, но каждый их вызов проходит через permission-check и audit-log.
+
+## Backward compatibility
+
+Все пять extension points — **additive** к существующей спецификации:
+
+- §1 `metadata` — новое опциональное поле в `PluginContext`. Существующие плагины игнорируют.
+- §2 chain-wrapping — расширение уже существующего класса диспетчеризации. Без middleware ничего не меняется.
+- §3 decoration ресурсов — инвариант над уже существующим механизмом DI.
+- §4 capability-filtering — дополнительный callback в реестре.
+- §5 trace-context propagation — конкретизация существующего инварианта из ADR-0003.
+
+Bump `kind_api_version` **не требуется**. Bump `schema_version` манифеста — minor (1.0 → 1.1) из-за добавления `metadata` в `PluginContext` schema.
+
+## Последствия
+
+**Положительные:**
+
+- Продукты governance / quota / observability разрабатываются **параллельно** с plugin-system, без блокировок.
+- Авторы плагинов пишут код, не зная про tenancy/quota — их плагины автоматически работают в мульти-клиентной среде, как только подключается governance-middleware.
+- Cross-product интеграция через общий контракт **канонических ключей `metadata`** — governance пишет `tenant_id`, quota читает; observability пишет `trace_context`, читают все.
+
+**Компромиссы:**
+
+- `PluginContext.metadata` — открытый словарь с типом `any` у значений. Type-safety обеспечивается спецификацией каждого горизонтального продукта (объявляет свои канонические ключи и их типы), а не ядром plugin-system.
+- Priority-диапазон `[1000, ∞)` для middleware — соглашение, не принуждение. Если автор плагина случайно использует `priority=2000`, он получит preference над governance. Смягчение: контрактный тест проверяет, что бизнес-плагины держат `priority < 1000`.
+
+**Что запрещено этим ADR**:
+
+- Horizontal-продукт **не может** требовать изменения hookspec бизнес-плагина для своего встраивания — все пять точек расширения самодостаточны.
+- Plugin-system ядро **не может** добавлять в `metadata` ключи с семантикой, которая интерпретируется им самим — ядро только хранит и пробрасывает, интерпретация — за middleware.
+
+## Связанные ADR
+
+- [ADR-0001](./0001-core) — `PluginContext`, в который ADR-0005 добавляет `metadata`.
+- [ADR-0002](./0002-hook-invocation) — `chain` и `capability` dispatch-классы, которые ADR-0005 канонизирует как middleware-механизм.
+- [ADR-0003](./0003-runtime-invariants) — Resources DI + trace-context invariant, которые ADR-0005 конкретизирует.
+
+## Нормативный источник
+
+Полный текст ADR-0005 с детализацией резервирования приоритетов, backward-compat гарантий и обсуждением open questions: [`plugin-system-spec/adr/0005-extensibility-hooks-for-horizontal-concerns.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0005-extensibility-hooks-for-horizontal-concerns.md).
+
+W3C Trace Context формат: https://www.w3.org/TR/trace-context/

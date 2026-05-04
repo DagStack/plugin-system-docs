@@ -1,0 +1,190 @@
+---
+sidebar_position: 1
+title: ADR-0001 · Core architecture
+description: What every implementation of dagstack/plugin-system consists of — manifest, registry, context, adapters, contract tests. How plugins are distributed. How versioning works.
+slug: /spec/adr/0001-core
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0001 · Core architecture
+
+**Status**: accepted v1.0 (2026-04-16) · [Full normative text](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0001-plugin-architecture-core.md)
+
+## Why a unified architecture specification
+
+`dagstack/plugin-system` is built for applications where many extension points — data sources, models, preprocessors, pipeline steps, integrations — change more often than the core itself. For the same plugins to work identically in a Python core and a TypeScript core, a shared map is needed: what every implementation MUST contain regardless of language, and what is an idiomatic detail of a particular implementation.
+
+ADR-0001 answers this question: **six mandatory components** that every distributable binding MUST contain.
+
+## Six mandatory components
+
+Every implementation (`plugin-system-python`, `plugin-system-typescript`, the planned `plugin-system-go`) consists of the following parts:
+
+1. **Manifest schema** — JSON Schema 2020-12, with the source of truth held in [`plugin-system-spec/_meta/manifest.schema.json`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta). All implementations generate their types from this schema — same fields, same names, same validation rules.
+2. **Hook dispatcher** — responsible for plugin registration, call routing, and lifecycle handling. Normative semantics live in [ADR-0002](./0002-hook-invocation).
+3. **Plugin registry (`PluginRegistry`)** — a wrapper around the dispatcher that adds discovery, manifest validation, and lifecycle setup.
+4. **Plugin context (`PluginContext`)** — a container of cross-cutting services passed to the plugin on `setup`: config, logger, metrics, tracer, event bus, registry, and an optional tenant context.
+5. **Runtime adapters** — at minimum three: `in_process` (native to the language), `mcp_stdio` (subprocess over stdio), `mcp_http` (remote HTTP service). The latter two are identical across languages because MCP is a cross-language protocol.
+6. **Contract test framework** — a set of mandatory scenarios (manifest validity, clean lifecycle teardown, no resource leaks) that every plugin MUST pass.
+
+## Three plugin distribution paths
+
+The architecture supports three plugin hosting scenarios simultaneously, with no "either/or" choice:
+
+- **A · In-tree** — a `plugins/` folder in the consumer application's monorepo. Plugins live next to business code, are deployed with it, and are versioned in the same git repo.
+- **B · Private packages** — separate modules in a private package registry (private PyPI, private npm registry). Suitable when a plugin is reused by several applications inside the same organisation.
+- **C · Public packages** — published to PyPI / npmjs.org / the Go module registry. Suitable for plugins aimed at the open-source community.
+
+The same plugin MAY be published through all three channels simultaneously. The consumer application chooses where to load it from at environment build time.
+
+## Mandatory minimum manifest
+
+The manifest is declared in one of the standard files:
+
+- `dagstack.toml` (convention for Python and Go);
+- `dagstack.json` (convention for TypeScript/Node);
+- a `[tool.dagstack.plugin]` section in `pyproject.toml` (for Python plugins published as a pip package);
+- a `dagstack` field in `package.json` (for TypeScript plugins).
+
+The minimum set of mandatory fields:
+
+| Field | Type | Purpose |
+|---|---|---|
+| `schema_version` | string | Version of the manifest JSON schema (at v1.0 = `"1"`). |
+| `name` | string | Unique plugin name within its kind. |
+| `kind` | string | Plugin kind — which contract it implements. |
+| `runtime` | string \| array | Runtime: `in_process` / `mcp_stdio` / `mcp_http`. |
+| `core_version` | string | Core version requirement (semver range). |
+
+The full manifest schema (normative JSON Schema 2020-12) is in the spec repository: [`_meta/manifest.schema.json`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta).
+
+## Version compatibility check
+
+A plugin declares supported core versions in the `core_version` field as a semver range (`^0.2`, `>=0.3.0 <1.0.0`). On registration, the registry checks that the installed version of `dagstack-plugin-system` (or its equivalent in other languages) satisfies the range. Incompatible plugins are rejected with a `VersionIncompatible` error — with an explicit indication of which version is required and which is installed.
+
+This protects against situations where a plugin silently stops working after a core upgrade: instead of strange behaviour at runtime, the user gets a clear error at startup.
+
+## Optional process isolation
+
+The `mcp_stdio` and `mcp_http` adapters allow a plugin to be run as a separate subprocess or remote service. The decision is **per-plugin**, not global:
+
+- an in-tree plugin runs in the main process (`in_process`);
+- an external plugin that needs isolation (for example, a "suspect" third-party plugin that MUST NOT be admitted to the main address space) is run as an MCP subprocess (`mcp_stdio`);
+- a plugin in a different language or deployed separately — through `mcp_http`.
+
+For the consumer application, all three options look identical — it works with a plugin proxy object without knowing which process the plugin is executing in.
+
+## Minimal plugin example
+
+Below is the same echo plugin in three languages. All three manifests are equivalent; differences in code are idiomatic features of the languages, not divergences in the contract.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```toml title="plugins/echo/dagstack.toml"
+    [plugin]
+    schema_version = "1"
+    name = "echo"
+    kind = "tool"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    ```
+
+    ```python title="plugins/echo/plugin.py"
+    from dagstack.plugin_system import PluginContext
+
+
+    class EchoPlugin:
+        async def setup(self, ctx: PluginContext) -> None:
+            self._ctx = ctx
+
+        def invoke(self, payload: str) -> str:
+            return payload
+
+        async def teardown(self) -> None:
+            pass
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    export class EchoPlugin {
+      private ctx?: PluginContext;
+      async setup(ctx: PluginContext): Promise<void> { this.ctx = ctx; }
+      async teardown(): Promise<void> { this.ctx = undefined; }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```toml title="plugins/echo/dagstack.toml"
+    [plugin]
+    schema_version = "1"
+    name = "echo"
+    kind = "tool"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    ```
+
+    ```go title="plugins/echo/plugin.go"
+    package echo
+
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type EchoPlugin struct {
+        ctx *pluginsystem.PluginContext
+    }
+
+    // Unwrap satisfies pluginsystem.Plugin — the registry uses it to surface
+    // the underlying domain object to consumers. Returning nil is fine when
+    // the plugin instance itself is the addressable surface.
+    func (p *EchoPlugin) Unwrap() any { return nil }
+
+    // Setup is invoked once during Registry.SetupAll in topo-order.
+    func (p *EchoPlugin) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        p.ctx = pluginCtx
+        return nil
+    }
+
+    func (p *EchoPlugin) Invoke(payload string) (string, error) {
+        return payload, nil
+    }
+
+    func (p *EchoPlugin) Teardown(ctx context.Context) error { return nil }
+    ```
+  </TabItem>
+</Tabs>
+
+## Consequences
+
+**Positive:**
+
+- A plugin MAY be written once (as a specification) and implemented identically in any language — with no behavioural divergence.
+- The consumer application chooses the core language independently of plugin languages — third-party plugins are wired in through MCP even if written in a different language.
+- The version-compatibility contract is fixed normatively; binary incompatibilities turn into clear errors at startup.
+
+**Trade-offs:**
+
+- Any change to the manifest schema requires a coordinated update of all implementations — otherwise a divergence in validation breaks compatibility.
+- Adding a new mandatory manifest field is a breaking change for all existing plugins, so it is done only via a `schema_version` bump plus a migration path.
+
+**What this ADR forbids**:
+
+- Adding manifest fields to a binding that are not in the normative schema (extensions are allowed only through `x-*` namespaced fields or through a separate ADR).
+- Changing the order of plugin lifecycle phases (registration → initialisation → teardown) — ADR-0002 fixes this normatively.
+
+## Related ADRs
+
+- [ADR-0002](./0002-hook-invocation) — hook invocation semantics that build on the registry concept introduced here.
+- [ADR-0003](./0003-runtime-invariants) — eight runtime invariants that guarantee orchestration neutrality.
+- [ADR-0004](./0004-hookspec) — the formalism by which types are emitted for each language from a plugin-kind specification.
+- [ADR-0006](./0006-discovery) — exactly how the registry locates plugins on the filesystem.
+
+## Normative source
+
+Full text of ADR-0001 with formal requirements for every implementation: [`plugin-system-spec/adr/0001-plugin-architecture-core.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0001-plugin-architecture-core.md).

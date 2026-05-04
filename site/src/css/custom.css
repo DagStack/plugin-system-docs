@@ -1,0 +1,30 @@
+/**
+ * Global styles and overrides for Infima theme variables.
+ * The dagstack brand palette is built around the gradient logo
+ * `#4A49DB → #3E38C9` (see site/static/img/logo.svg).
+ */
+
+:root {
+  /* Primary — indigo from the top of the gradient logo. */
+  --ifm-color-primary: #4A49DB;
+  --ifm-color-primary-dark: #3E38C9;
+  --ifm-color-primary-darker: #3530B5;
+  --ifm-color-primary-darkest: #282495;
+  --ifm-color-primary-light: #6261E1;
+  --ifm-color-primary-lighter: #7574E5;
+  --ifm-color-primary-lightest: #9696EB;
+  --ifm-code-font-size: 95%;
+  --docusaurus-highlighted-code-line-bg: rgba(74, 73, 219, 0.08);
+}
+
+/* For the dark theme — lighter shades for readability on a dark background. */
+[data-theme='dark'] {
+  --ifm-color-primary: #8988E9;
+  --ifm-color-primary-dark: #7574E5;
+  --ifm-color-primary-darker: #6261E1;
+  --ifm-color-primary-darkest: #4A49DB;
+  --ifm-color-primary-light: #9E9DEE;
+  --ifm-color-primary-lighter: #BFBEF4;
+  --ifm-color-primary-lightest: #D6D5F8;
+  --docusaurus-highlighted-code-line-bg: rgba(137, 136, 233, 0.12);
+}

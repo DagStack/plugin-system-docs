@@ -1,0 +1,263 @@
+---
+sidebar_position: 4
+title: Plugin kinds
+description: What a plugin kind is, the built-in kinds, and how to declare your own kind through a hookspec.
+slug: /concepts/kinds
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Plugin kinds
+
+A **plugin kind** (`kind`) is a contract every plugin of that kind must satisfy. A kind defines:
+
+- the set of hooks the plugin must implement;
+- the input and output types of each hook;
+- the dispatch semantics (one of five classes — see [ADR-0002](../spec/adr/0002-hook-invocation));
+- the resource requirements (what the application is obliged to inject).
+
+When you write a plugin and declare `kind = "chunker"` in the manifest, the core checks that your plugin honours the `chunker` kind contract and registers it. Other parts of the application then request plugins by kind without knowing the names of specific implementations.
+
+## Built-in kinds
+
+The current v1.0 release fixes two kinds normatively in the spec repository; further kinds are declared by the consumer application:
+
+| Kind | Hookspec | Purpose |
+|---|---|---|
+| `tool` | [`kinds/tool/v1.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/kinds/tool) | Function-as-plugin: takes a structured argument, returns a structured result. |
+| `orchestrator` | [`kinds/orchestrator/v1.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/kinds/orchestrator) | Lifecycle management for long-running operations — `enqueue`, `status`, `backfill`. |
+
+Many applications use **domain-specific kinds** declared by the consumer application itself. A few typical groupings:
+
+**Data processing:**
+
+- `source` — a data source (an S3 bucket, a Postgres table, a Kafka topic).
+- `processor` — record transformation or enrichment.
+- `sink` — a target store (Elasticsearch, a warehouse, a file).
+
+**Notifications and integrations:**
+
+- `notifier` — sending notifications (email / SMS / webhook / push).
+- `auth_provider` — OAuth / SAML / LDAP integration.
+- `webhook_handler` — incoming webhook handler.
+
+**Business logic:**
+
+- `payment_provider` — Stripe / PayPal / an in-house payment module.
+- `tax_calculator` — tax calculation per jurisdiction.
+- `pricing_strategy` — a pricing strategy.
+
+**AI / RAG (one possible scenario):**
+
+- `llm` — a language model.
+- `embedder` — text → vector.
+- `vector_store` — a vector store.
+- `chunker` — splitting text into fragments.
+- `reranker` — re-ranking.
+
+**Observability / platform:**
+
+- `metric_exporter` — metric export to Prometheus / OTLP.
+- `audit_logger` — recording events to an audit trail.
+- `rate_limiter` — rate limiting requests.
+
+These kinds are not built into the plugin-system core — the application registers their hookspecs at start-up. The same plugin-system installation serves all of these groupings: plugin-system has no knowledge of the domain, only of contracts.
+
+## Kind — an opaque string for the core
+
+The plugin-system **does not validate** the value of the manifest's `kind` field. To the core it is an opaque identifier. Responsibility for the list of permitted kinds lies with the consumer application:
+
+1. The application registers the hookspecs for the kinds it expects at start-up.
+2. During discovery, a plugin manifest with an unknown `kind` is rejected with `KindUnknown`.
+3. The application reads plugins of a given kind through `registry.get_plugin("kind", name="...")` or via a dispatcher.
+
+This makes `kind` an extensible concept — the application defines its own set of kinds without changes to the plugin-system core.
+
+## Declaring your own kind
+
+Applications often need their own plugin kinds — for example, a `notifier` with a specific signature `send(recipient, message, metadata)`, a `payment_provider` with `charge(amount, customer_id, idempotency_key)`, or an `llm` with `complete(prompt, temperature, max_tokens)`. Declaring your own kind takes two steps:
+
+### 1. Write a hookspec in YAML
+
+The hookspec describes every hook of the kind, their signatures (via JSON Schema), and the dispatch classes.
+
+```yaml title="kinds/llm/v1.yaml"
+kind: llm
+kind_api_version: 1.0.0
+description: |
+  A language model — completes text from a prompt; optionally supports a
+  chat interface and streaming.
+
+hooks:
+  - name: complete
+    dispatch: singleton
+    description: Generate a completion for the prompt.
+    input_schema: schemas/complete.input.json
+    output_schema: schemas/complete.output.json
+    mcp_exposed: true
+
+  - name: chat
+    dispatch: singleton
+    description: A chat request with a message history.
+    input_schema: schemas/chat.input.json
+    output_schema: schemas/chat.output.json
+    mcp_exposed: true
+```
+
+The hookspec structure is described in detail in [ADR-0004](../spec/adr/0004-hookspec).
+
+### 2. Generate types for your language
+
+Types are emitted from the hookspec for each implementation (pydantic for Python, zod for TypeScript, struct + interface for Go). The application commits the generated code to its own repository and uses it as ordinary types.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # Generated from kinds/llm/v1.yaml
+    from typing import Protocol
+    from pydantic import BaseModel
+
+
+    class CompleteInput(BaseModel):
+        prompt: str
+        temperature: float = 0.7
+        max_tokens: int | None = None
+
+
+    class CompleteOutput(BaseModel):
+        text: str
+        tokens_used: int
+
+
+    class LLMPlugin(Protocol):
+        def complete(self, input: CompleteInput) -> CompleteOutput: ...
+        def chat(self, input: ChatInput) -> ChatOutput: ...
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    // Generated from kinds/llm/v1.yaml (zod schemas + interfaces)
+    import { z } from "zod";
+
+    export const CompleteInputSchema = z.object({
+      prompt: z.string(),
+      temperature: z.number().min(0).max(2),
+      max_tokens: z.number().int().positive().optional(),
+    }).strict();
+    export type CompleteInput = z.infer<typeof CompleteInputSchema>;
+
+    export const CompleteOutputSchema = z.object({
+      text: z.string(),
+      tokens_used: z.number().int().nonnegative(),
+    }).strict();
+    export type CompleteOutput = z.infer<typeof CompleteOutputSchema>;
+
+    export interface LLMPlugin {
+      complete(input: CompleteInput): Promise<CompleteOutput>;
+      chat(input: ChatInput): Promise<ChatOutput>;
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // Generated from kinds/llm/v1.yaml
+    package llm
+
+    type CompleteInput struct {
+        Prompt      string   `json:"prompt"`
+        Temperature float64  `json:"temperature"`
+        MaxTokens   *int     `json:"max_tokens,omitempty"`
+    }
+
+    type LLMPlugin interface {
+        Complete(input CompleteInput) (CompleteOutput, error)
+        Chat(input ChatInput) (ChatOutput, error)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### 3. Register the hookspec in the application
+
+At start-up the application registers the hookspec so that the core can validate manifests of plugins of that kind:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+    from my_app.kinds import LlmHookSpec, EmbedderHookSpec, VectorStoreHookSpec
+
+
+    async def main() -> None:
+        registry = PluginRegistry()
+        # Register the hookspecs of our kinds first.
+        registry.add_hookspecs(LlmHookSpec)
+        registry.add_hookspecs(EmbedderHookSpec)
+        registry.add_hookspecs(VectorStoreHookSpec)
+
+        registry.discover("plugins/")
+
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("app"),
+            registry=registry,
+        )
+        await registry.setup_all(ctx)
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    :::warning Custom-kind hookspec registration is host-side
+    `@dagstack/plugin-system 0.2.0-rc.1` ships emitted types for the canonical kinds (`tool`, `orchestrator`); the registry itself is kind-agnostic and does NOT enforce custom-kind hookspecs. The pattern is: emit `LLMPlugin` / `EmbedderPlugin` / `VectorStorePlugin` interfaces from `kinds/*/v1.yaml` into your app, then enforce them at registration through TypeScript's structural typing (`plugin satisfies LLMPlugin`) before calling `registerManifest()`. A first-class `withKindHookspecs()` discovery option is on the Phase 2 roadmap.
+    :::
+
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+    import type { LLMPlugin, EmbedderPlugin, VectorStorePlugin } from "./kinds/index.js";
+
+    async function main(): Promise<void> {
+      const registry = new PluginRegistry();
+      // Type-only check: plugins of these kinds will be later asserted
+      // at the call site as `instance satisfies LLMPlugin`.
+      void (null as unknown as LLMPlugin);
+      void (null as unknown as EmbedderPlugin);
+      void (null as unknown as VectorStorePlugin);
+
+      await discover(registry, "plugins/");
+      await registry.setupAll();
+    }
+
+    await main();
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::warning Custom-kind hookspec registration is host-side
+    `go.dagstack.dev/plugin-system v0.1.0-rc.1` does not bake hookspec loading into `Discover()` — Phase 1 deliberately keeps the registry kind-agnostic. The pattern is: emit `LLMPlugin` / `EmbedderPlugin` / `VectorStorePlugin` Go interfaces from `kinds/*/v1.yaml` into your application package, then enforce them at registration via type assertion (`plugin.Unwrap().(LLMPlugin)`) before calling `RegisterManifest()`. A first-class `WithKindHookspecs()` discovery option is on the Phase 2 roadmap.
+    :::
+  </TabItem>
+</Tabs>
+
+## Versioning kinds
+
+A kind hookspec is versioned through the `kind_api_version` field (semver). The plugin states in its manifest which version of the kind it implements; on incompatibility the registry raises `VersionIncompatible`.
+
+- **Minor bump** (`1.0.0` → `1.1.0`) — a new optional hook is added; existing plugins continue to work.
+- **Major bump** (`1.0.0` → `2.0.0`) — a breaking change in the signature of an existing hook. Plugins must update.
+
+## Anti-patterns
+
+- **A "mega-kind" for everything.** A kind whose hooks span ten different operations (`chunk`, `embed`, `search`, `rerank`) erases the boundaries between responsibilities. Split it into specialised kinds.
+- **A kind for a single plugin.** If a kind has only one implementation and there are no plans for alternatives, you may simply have a function call rather than a plugin. A plugin is justified when at least two implementations exist, real or potential.
+- **Ad-hoc kind names without conventions.** Within an application's ecosystem, agree on a naming convention: lowercase, `snake_case`, nouns, no version in the name. `llm`, not `LLM` / `LanguageModel` / `llm_v2`.
+
+## See also
+
+- [Plugin manifest](./manifest) — the `kind` and `kind_api_version` fields.
+- [Discovery](./discovery) — how `discover()` validates `kind`.
+- [ADR-0004: Hookspec formalism](../spec/adr/0004-hookspec) — the YAML format for kind specs.
+- [Guide: Writing a plugin](../guides/writing-a-plugin) — a hands-on example.

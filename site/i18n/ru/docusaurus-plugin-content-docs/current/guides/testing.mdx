@@ -1,0 +1,506 @@
+---
+sidebar_position: 4
+title: Тестирование плагинов
+description: Как запускать unit-тесты плагина, контрактные тесты, интеграционные тесты с реальной экосистемой. Структура директорий, CI-интеграция, отладка проваленных проверок.
+slug: /guides/testing
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Тестирование плагинов
+
+Каждый плагин в production проходит три уровня проверок:
+
+1. **Unit-тесты** — изолированная логика плагина, mock-ресурсы, быстрый фидбэк.
+2. **Контрактные тесты** — автоматическая проверка соблюдения восьми runtime-инвариантов через `run_contract_suite` (или эквивалент в TS/Go реализации).
+3. **Интеграционные тесты** — плагин запускается в реальном host-окружении с реальными ресурсами (настоящий HTTP-клиент, настоящий clock, настоящая БД).
+
+Эта страница — как эти три уровня запускать и встраивать в CI. Что именно инъектировать в контекст (frozen-clock, in-memory blob-store и т.д.) — на странице [Ресурсы](../concepts/resources).
+
+## Структура директорий
+
+Рекомендуемый layout для локальных тестов плагина:
+
+```
+plugins/
+└── my-plugin/
+    ├── dagstack.toml
+    ├── plugin.py                 # реализация
+    ├── tests/
+    │   ├── test_plugin.py        # unit-тесты
+    │   ├── test_contract.py      # контрактные тесты
+    │   └── test_integration.py   # интеграционные (опционально)
+    └── README.md
+```
+
+`tests/` внутри плагина позволяет запускать проверки изолированно:
+
+```bash
+cd plugins/my-plugin && pytest tests/
+```
+
+## Unit-тесты
+
+Пишутся как обычные unit-тесты языка, плагин получает тестовый `PluginContext` с подменёнными ресурсами.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugins/fixed-chunker/tests/test_plugin.py"
+    import asyncio
+    import logging
+    from datetime import datetime, UTC
+
+    import pytest
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+    from dagstack.plugin_system import FrozenClock, ResourceRegistry
+    from plugins.fixed_chunker.plugin import FixedChunker
+
+
+    @pytest.fixture
+    def plugin():
+        resources = ResourceRegistry()
+        resources.register("clock", FrozenClock(now=datetime(2026, 1, 1, tzinfo=UTC)))
+        registry = PluginRegistry(resource_registry=resources)
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("test"),
+            registry=registry,
+        )
+        plugin = FixedChunker()
+        asyncio.run(plugin.setup(ctx))
+        return plugin
+
+
+    def test_chunks_empty_text(plugin):
+        assert plugin.chunk("", max_size=10) == []
+
+
+    def test_chunks_exact_size(plugin):
+        result = plugin.chunk("abcde", max_size=5)
+        assert len(result) == 1
+        assert result[0].text == "abcde"
+        assert result[0].offset == 0
+
+
+    def test_chunks_splits_by_size(plugin):
+        result = plugin.chunk("abcdefgh", max_size=3)
+        assert [c.text for c in result] == ["abc", "def", "gh"]
+        assert [c.offset for c in result] == [0, 3, 6]
+
+
+    def test_rejects_invalid_size(plugin):
+        with pytest.raises(ValueError, match="positive"):
+            plugin.chunk("any", max_size=0)
+    ```
+
+    ```bash
+    cd plugins/fixed-chunker && pytest tests/test_plugin.py -v
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::info Test resources are user-side in 0.1.x
+    The Go binding does not yet ship test fakes (`FrozenClock`, `DeterministicRng`, `InMemoryBlobStore`) or a resource registry; tests construct a `*PluginContext` directly and provide a small custom `Resources` implementation that satisfies `Resources.Get(name)`. The reference resource catalogue lands in Phase 2.
+    :::
+
+    ```go title="plugins/fixed-chunker/tests/plugin_test.go"
+    package fixed_test
+
+    import (
+        "context"
+        "fmt"
+        "log/slog"
+        "testing"
+        "time"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+        fixed "github.com/your-org/plugins/fixed-chunker"
+    )
+
+    type frozenClock struct{ now time.Time }
+
+    func (c *frozenClock) Now() time.Time { return c.now }
+
+    type testResources struct {
+        items map[string]any
+    }
+
+    func (r *testResources) Get(name string) (any, error) {
+        v, ok := r.items[name]
+        if !ok {
+            return nil, fmt.Errorf("resource %q not registered", name)
+        }
+        return v, nil
+    }
+
+    func newPlugin(t *testing.T) *fixed.FixedChunker {
+        t.Helper()
+        pluginCtx := &pluginsystem.PluginContext{
+            Logger:   slog.Default(),
+            Registry: pluginsystem.NewRegistry(),
+            Resources: &testResources{items: map[string]any{
+                "clock": &frozenClock{now: time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)},
+            }},
+        }
+        p := &fixed.FixedChunker{}
+        if err := p.Setup(context.Background(), pluginCtx); err != nil {
+            t.Fatal(err)
+        }
+        return p
+    }
+
+    func TestChunkEmpty(t *testing.T) {
+        p := newPlugin(t)
+        if got, _ := p.Chunk("", 10); len(got) != 0 {
+            t.Fatalf("expected empty, got %v", got)
+        }
+    }
+
+    func TestChunkSplit(t *testing.T) {
+        p := newPlugin(t)
+        got, _ := p.Chunk("abcdefgh", 3)
+        if len(got) != 3 || got[0].Text != "abc" || got[2].Text != "gh" {
+            t.Fatalf("unexpected chunks: %v", got)
+        }
+    }
+    ```
+
+    ```bash
+    cd plugins/fixed-chunker && go test ./tests/
+    ```
+  </TabItem>
+</Tabs>
+
+## Контрактные тесты
+
+Контрактная рамка автоматически проверяет все восемь runtime-инвариантов через `run_contract_suite`. Каждая проверка — `assert_*`-функция, агрегированный результат даёт понятный отчёт.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugins/fixed-chunker/tests/test_contract.py"
+    from dagstack.plugin_system import (
+        load_manifest,
+        run_contract_suite,
+        ALL_CHECKS,
+    )
+    from plugins.fixed_chunker.plugin import FixedChunker
+
+
+    def test_contract_passes():
+        manifest = load_manifest("plugins/fixed-chunker/dagstack.toml")
+        result = run_contract_suite(
+            plugin_class=FixedChunker,
+            manifest=manifest,
+            checks=ALL_CHECKS,
+        )
+        assert result.ok, result.format_failures()
+    ```
+
+    Run:
+
+    ```bash
+    pytest plugins/fixed-chunker/tests/test_contract.py -v
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::info Contract suite is Python-only in Phase 1
+    The full contract suite (`run_contract_suite`, `assert_lifecycle_clean`, `assert_orchestration_neutral`, `assert_deterministic`, etc.) ships only in `dagstack-plugin-system` (Python) for the v0.1 line. The Go binding will gain a parallel suite in Phase 2; until then, validate Go plugins via standard `go test` against the same scenarios and verify the manifest with `LoadManifestFromFile` + `Manifest.Validate()`.
+    :::
+
+    ```go title="plugins/fixed-chunker/tests/manifest_test.go"
+    package fixed_test
+
+    import (
+        "testing"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    func TestManifestValid(t *testing.T) {
+        manifest, err := pluginsystem.LoadManifestFromFile("plugins/fixed-chunker/dagstack.toml")
+        if err != nil {
+            t.Fatal(err)
+        }
+        if err := manifest.Validate(); err != nil {
+            t.Fatalf("manifest validation failed: %v", err)
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Отладка проваленных контрактных проверок
+
+Контракт-suite возвращает структурированный отчёт с указанием нарушенного инварианта и конкретного места. Типичные проблемы:
+
+| Проверка | Сообщение | Что проверить |
+|---|---|---|
+| `assert_no_ambient_state` | `AmbientStateViolation: module-level mutable state` | Убрать global-переменные, module-level `dict`/`list`; перенести в экземпляр плагина или в `Resources`. |
+| `assert_json_serializable_boundaries` | `SerializationError: <class 'httpx.AsyncClient'> is not JSON-serializable` | Живой клиент попал в output хука; возвращать данные, не ресурсы. |
+| `assert_json_serializable_boundaries` | `SerializationError: datetime not JSON-serializable` | Конвертируйте `datetime` в ISO 8601 строку перед возвратом. |
+| `assert_lifecycle_clean` | `LeakDetected: tmpdir contains N files after teardown` | В `teardown()` добавить очистку временных файлов. |
+| `assert_deterministic` | `DeterminismError: different output on second run with same seed` | Использовать `ctx.clock.now()` и `ctx.rng` вместо `time.time()` / `random()`. |
+| `assert_manifest_valid` | `ManifestInvalid: required field missing` | Проверить поля манифеста против [страницы «Манифест плагина»](../concepts/manifest) (полная схема в spec-репозитории). |
+
+## Интеграционные тесты
+
+Запускают плагин в настоящем host-окружении: реальный реестр, реальные ресурсы (или их staging-версии), реальный конфиг.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="tests/test_integration.py"
+    import asyncio
+    import logging
+
+    import pytest
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+
+    @pytest.fixture
+    def real_registry():
+        registry = PluginRegistry()
+        registry.discover("plugins/")
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("test"),
+            registry=registry,
+        )
+        asyncio.run(registry.setup_all(ctx))
+        yield registry
+        asyncio.run(registry.teardown_all())
+
+
+    def test_pipeline_end_to_end(real_registry):
+        chunker = real_registry.get_plugin("chunker", name="fixed")
+        result = chunker.chunk("Hello, dagstack!", max_size=5)
+        # The plugin interacts with the real Clock/Rng — assert the structure,
+        # not the exact values.
+        assert len(result) == 4
+        assert all(c.offset % 5 == 0 for c in result[:-1])
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="tests/integration_test.go"
+    package integration_test
+
+    import (
+        "context"
+        "log/slog"
+        "testing"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+        fixed "github.com/your-org/plugins/fixed-chunker"
+    )
+
+    func TestChunkerEndToEnd(t *testing.T) {
+        ctx := context.Background()
+
+        entries, err := pluginsystem.Discover("plugins/")
+        if err != nil {
+            t.Fatal(err)
+        }
+
+        reg := pluginsystem.NewRegistry()
+        for _, entry := range entries {
+            plugin := buildPlugin(entry.Manifest)
+            if err := reg.RegisterManifest(entry.Manifest, plugin); err != nil {
+                t.Fatal(err)
+            }
+        }
+
+        pluginCtx := &pluginsystem.PluginContext{
+            Logger:   slog.Default(),
+            Registry: reg,
+        }
+        if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+            t.Fatal(err)
+        }
+        defer reg.TeardownAll(ctx)
+
+        disp := pluginsystem.NewDispatchSingleton[*fixed.FixedChunker](reg, "chunker")
+        chunker, err := disp.Resolve()
+        if err != nil {
+            t.Fatal(err)
+        }
+        result, _ := chunker.Chunk("Hello, dagstack!", 5)
+        if len(result) != 4 {
+            t.Fatalf("expected 4 chunks, got %d", len(result))
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## CI-интеграция
+
+Каждый PR запускает три группы проверок:
+
+```yaml title=".gitea/workflows/plugin-tests.yml"
+name: Plugin tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: dagstack-runner
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install -e '.[test]'
+
+      - name: Unit tests
+        run: pytest plugins/*/tests/test_plugin.py -v
+
+      - name: Contract tests
+        run: pytest plugins/*/tests/test_contract.py -v
+
+      - name: Integration tests
+        run: pytest tests/test_integration.py -v
+        env:
+          DAGSTACK_TEST_MODE: "1"
+```
+
+Контрактные тесты — **обязательные**. Unit и интеграционные — recommended, приоритеты зависят от важности плагина.
+
+## Параметризованные контрактные тесты
+
+Если у вас много плагинов одного вида, параметризуйте один общий контрактный тест:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import pytest
+    from pathlib import Path
+    from dagstack.plugin_system import load_manifest, run_contract_suite, ALL_CHECKS
+
+
+    ALL_PLUGINS = list(Path("plugins").glob("*/dagstack.toml"))
+
+
+    @pytest.mark.parametrize("manifest_path", ALL_PLUGINS, ids=lambda p: p.parent.name)
+    def test_every_plugin_passes_contract(manifest_path):
+        manifest = load_manifest(manifest_path)
+        plugin_class = _load_plugin_class(manifest_path.parent, manifest.entry_point)
+        result = run_contract_suite(
+            plugin_class=plugin_class,
+            manifest=manifest,
+            checks=ALL_CHECKS,
+        )
+        assert result.ok, result.format_failures()
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::info Contract suite is Python-only in Phase 1
+    Until the Go contract harness lands in Phase 2, parameterised checks in Go cover only the manifest layer. Validate every plugin's `dagstack.toml` and run business-level scenarios with standard `go test`.
+    :::
+
+    ```go
+    package contract_test
+
+    import (
+        "path/filepath"
+        "testing"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    func TestAllPluginsManifestValid(t *testing.T) {
+        paths, _ := filepath.Glob("plugins/*/dagstack.toml")
+        for _, p := range paths {
+            p := p
+            t.Run(filepath.Base(filepath.Dir(p)), func(t *testing.T) {
+                manifest, err := pluginsystem.LoadManifestFromFile(p)
+                if err != nil {
+                    t.Fatal(err)
+                }
+                if err := manifest.Validate(); err != nil {
+                    t.Fatal(err)
+                }
+            })
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Новый плагин, добавленный в `plugins/`, автоматически попадает в параметризованный запуск — отдельный тестовый код не нужен.
+
+## См. также
+
+- [Инварианты runtime](../concepts/invariants) — что именно проверяет каждая `assert_*`-функция.
+- [Ресурсы (Resources DI)](../concepts/resources) — как инъектировать тестовые версии ресурсов.
+- [Жизненный цикл плагина](./lifecycle) — когда вызывается `setup`/`teardown`, важно для интеграционных тестов.

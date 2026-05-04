@@ -1,0 +1,11 @@
+{
+  "label": "ADR",
+  "position": 2,
+  "collapsible": true,
+  "collapsed": false,
+  "link": {
+    "type": "generated-index",
+    "title": "ADR (Architecture Decision Records)",
+    "description": "Six ADRs that pin the architectural decisions of `dagstack/plugin-system`. Each page summarises the key decisions in English, gives a Python/TypeScript/Go example, and links to the full normative ADR in the spec repository."
+  }
+}

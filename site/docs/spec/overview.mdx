@@ -1,0 +1,71 @@
+---
+sidebar_position: 1
+title: What the specification is
+description: The role of `dagstack/plugin-system-spec` as the normative source of truth that every implementation (Python, TypeScript, Go) MUST honour. How ADRs differ from guides, and at which level each question is decided.
+slug: /spec/overview
+---
+
+# What the specification is
+
+`dagstack/plugin-system-spec` is the normative source of truth. It pins down **what** every plugin-system implementation (for Python, TypeScript, Go and any future language) MUST contain — and **why** it is so, rather than otherwise. Concrete implementations (`plugin-system-python`, `plugin-system-typescript`, `plugin-system-go`) MUST honour this contract and demonstrate compliance via a shared set of conformance tests.
+
+## How the "Specification" section differs from the guides
+
+| Section | Audience | What it gives you |
+|---|---|---|
+| [Concepts](../concepts/registry) | Plugin-system user | Explains **how** the registry, manifest and dispatcher work today, applied to a specific language. |
+| [Guides](../guides/writing-a-plugin) | Plugin-system user | Walks through a task step by step (write a plugin, configure it). |
+| **Specification** (this section) | Implementation author / author of a new plugin kind / reviewer | Explains **why** a decision was made; pins the normative guarantees you can rely on; describes which situations every binding MUST handle the same way regardless of language. |
+
+If you are writing a plugin for Python or TypeScript, read "Concepts" and "Guides". If you are:
+
+- implementing your own binding for a new language;
+- designing your own plugin kind (hookspec) and want it to work across all languages;
+- taking part in an architectural review of core changes;
+
+then this section is for you.
+
+## How ADRs differ from ordinary documentation
+
+An ADR (Architecture Decision Record) is a short document that captures **one** architectural decision:
+
+- **Context** — which problem is being solved, and what made it hard to solve before.
+- **Decision** — what is being done and by which means.
+- **Consequences** — what becomes easier / harder / impossible after this decision.
+- **Alternatives** — which options were considered and why they were rejected.
+
+An ADR is a historical artefact. When a decision is revisited the ADR is not deleted — a new ADR appears that `supersedes` the previous one. This makes it possible to trace the evolution of the architecture and to understand the rationale behind the current state.
+
+## The six plugin-system ADRs
+
+As of v1.0 the specification pins six decisions:
+
+1. **[ADR-0001: Core architecture](./adr/0001-core)** — what a plugin, manifest, registry and context are. The shared structure of every implementation.
+2. **[ADR-0002: Hook invocation semantics](./adr/0002-hook-invocation)** — five dispatch classes (singleton / broadcast-collect / broadcast-notify / chain / capability) and their normative behaviour.
+3. **[ADR-0003: Orchestration-neutral runtime](./adr/0003-runtime-invariants)** — the eight runtime invariants that make a plugin behave identically under FastAPI, Dagster, Celery and pytest.
+4. **[ADR-0004: Hookspec formalism](./adr/0004-hookspec)** — how a plugin-kind contract is described via YAML + JSON Schema, from which per-language types are emitted.
+5. **[ADR-0005: Horizontal extensions](./adr/0005-horizontal-hooks)** — governance, quota and observability layered on top of any user plugin.
+6. **[ADR-0006: File-based discovery](./adr/0006-discovery)** — how, exactly, the registry locates plugins on the filesystem.
+
+## Normative vs descriptive text
+
+The pages in this section are a **descriptive English-language synopsis** of each ADR. They translate the formal contract into accessible prose and add cross-language examples.
+
+**The formal normative text of every ADR** lives in the spec repository [`dagstack/plugin-system-spec`](https://github.com/dagstack/plugin-system-spec/tree/main/adr). Every page in this section has a direct link to the full text of the corresponding ADR. If you are preparing a change to a binding, read the normative version: that is where every edge case, every forbidden construction and every error-message requirement is pinned down.
+
+## How the specification is changed
+
+If you want to change plugin-system behaviour (add a sixth dispatch class, relax an invariant, change the manifest format):
+
+1. Open an issue in [`dagstack/plugin-system-spec`](https://github.com/dagstack/plugin-system-spec/issues) describing the problem and the proposed solution.
+2. After discussion, raise a PR with a new ADR (`ADR-0007+`) or a revision of an existing one (with an explicit `supersedes`).
+3. Pass architect review and review by the maintainers of the implementations — every `plugin-system-<lang>` MUST confirm that the proposal can be implemented.
+4. After merge, update the implementations and refresh the corresponding synopsis in this section (in the same spec-repo PR, so that drift cannot creep in).
+
+## Related specifications
+
+- [`dagstack/config-spec`](https://github.com/dagstack/config-spec) — the plugin system uses the config stack to read per-plugin sections (`<kind>.<name>`).
+- [`dagstack/logger-spec`](https://github.com/dagstack/logger-spec) — structured logging exposed via `PluginContext.logger`.
+- [`dagstack/tenancy-spec`](https://github.com/dagstack/tenancy-spec) — `TenantContext` is delivered through `PluginContext` for multi-tenant isolation.
+
+A decision-by-decision relationship table is on the [Cross-spec relationships](./cross-spec) page.

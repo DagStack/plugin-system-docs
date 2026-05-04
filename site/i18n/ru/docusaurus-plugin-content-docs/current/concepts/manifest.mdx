@@ -1,0 +1,193 @@
+---
+sidebar_position: 2
+title: Манифест плагина
+description: Схема файла dagstack.toml — обязательные и опциональные поля, виды (kind), исполняющие среды (runtime), требования к ресурсам.
+slug: /concepts/manifest
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Манифест плагина
+
+Манифест — это файл `dagstack.toml` в корне папки плагина. Он декларирует метаданные плагина и требования к среде исполнения. Манифест — **единственный источник истины** для обнаружения: плагин без манифеста реестром не виден, даже если код корректен.
+
+## Минимальный манифест
+
+```toml title="plugins/my-plugin/dagstack.toml"
+[plugin]
+name = "my-plugin"
+kind = "tool"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+```
+
+Этого достаточно для первой регистрации. Все опциональные поля — ниже.
+
+## Обязательные поля
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `name` | строка | Имя плагина, уникальное в пределах `kind`. Строчные буквы, цифры, дефис, нижнее подчёркивание. |
+| `kind` | строка | Вид плагина — какой контракт он реализует. Примеры: `llm`, `vector_store`, `chunker`, `pipeline`, `tool`, `orchestrator`. |
+| `runtime` | строка или массив | Исполняющая среда: `in_process`, `mcp_stdio`, `mcp_http`. Допускается массив (плагин поддерживает несколько сред). |
+| `core_version` | строка | Требование к версии ядра `dagstack-plugin-system`, semver range. |
+
+## Опциональные поля
+
+### Метаинформация
+
+```toml
+[plugin]
+name = "qdrant"
+kind = "vector_store"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+version = "1.2.0"
+description = "Vector store adapter for Qdrant."
+authors = ["Dagstack Contributors"]
+homepage = "https://example.org/qdrant-plugin"
+license = "Apache-2.0"
+```
+
+### Возможности (capabilities)
+
+Используется диспетчером `CapabilityDispatcher` для выбора подходящего плагина под запрос. Возможности — произвольные строковые идентификаторы, семантика определяется видом.
+
+```toml
+[plugin]
+name = "semantic-chunker"
+kind = "chunker"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+capabilities = ["treesitter", "python", "typescript", "go"]
+```
+
+### Ресурсы
+
+Плагин декларирует, какие системные ресурсы ему нужны. Реестр подставляет их через `inject_resources` перед вызовом `setup`.
+
+```toml
+[plugin]
+name = "sha-tagger"
+kind = "tool"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+
+[plugin.resources]
+required = ["Clock", "Rng", "BlobStore"]
+```
+
+В тестах стандартные ресурсы заменяются детерминированными: `SystemClock` → `FrozenClock`, `RandomRng` → `DeterministicRng`, `InMemoryBlobStore` остаётся.
+
+### Единица работы
+
+Для плагинов, участвующих в оркестрации (Dagster, Celery, k8s), декларируется единица работы — набор ключей партиционирования и ожидаемая модель исполнения.
+
+```toml
+[plugin]
+name = "file-indexer"
+kind = "pipeline"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+execution_model = "async"       # стиль исполнения хуков (sync | async | thread_cpu_bound | process_cpu_bound)
+
+[plugin.unit_of_work]
+declared = true
+partition_key = "repo_id"
+idempotency_mode = "input_hash"    # input_hash | output_hash | none
+checkpointable = true
+content_hash = ["tenant_id", "repo_id", "file_sha"]
+```
+
+:::note
+`execution_model` — это **стиль исполнения хуков плагина** (sync/async/CPU-bound), не класс диспетчеризации. Класс диспетчеризации (`singleton`, `broadcast_collect`, `chain`, `capability`) объявляется **в hookspec вида плагина** — в поле `dispatch:` каждого хука. См. [ADR-0004](../spec/adr/0004-hookspec) и [Классы диспетчеризации](./dispatch).
+:::
+
+- `partition_keys` — поля, по которым оркестратор параллелит работу.
+- `idempotent` — признак, что повторный запуск с тем же `content_hash` даст тот же результат (оркестратор может пропустить).
+- `content_hash` — перечень полей для вычисления ключа идемпотентности.
+
+### Поддерживаемые возможности диспетчера
+
+```toml
+[plugin]
+name = "openai-embedder"
+kind = "embedder"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+supports_languages = ["en", "ru"]
+supports_mime_types = ["text/plain"]
+
+[plugin.supports]
+text = true
+image = false
+batch = true
+streaming = false
+```
+
+Поля `supports_*` используются `CapabilityDispatcher` для отбора плагинов под конкретный запрос. Решение, использовать ли `capability`-dispatch для хуков вида, принимается в hookspec вида в поле `dispatch:` — не в манифесте плагина.
+
+## Размещение манифеста в `pyproject.toml` (Python)
+
+Для Python-плагинов, распространяемых как пакеты, допускается размещать содержимое манифеста в секции `[tool.dagstack.plugin]` файла `pyproject.toml`. Это удобно для публикуемых на PyPI плагинов, чтобы не дублировать метаданные.
+
+```toml title="pyproject.toml"
+[project]
+name = "dagstack-plugin-openai"
+version = "0.1.0"
+
+[tool.dagstack.plugin]
+name = "openai_compatible"
+kind = "llm"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+```
+
+Приоритет: если у плагина есть и `dagstack.toml`, и `[tool.dagstack.plugin]` в `pyproject.toml`, используется `dagstack.toml`.
+
+## Валидация
+
+Валидация выполняется автоматически при `discover`. Вручную валидировать отдельный манифест можно так:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import load_manifest, assert_manifest_valid
+    from my_plugin import MyPlugin
+
+    manifest = load_manifest("plugins/my-plugin/dagstack.toml")
+    assert_manifest_valid(MyPlugin, manifest)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    manifest, err := pluginsystem.LoadManifestFromFile("plugins/my-plugin/dagstack.toml")
+    if err != nil {
+        return err
+    }
+    if err := manifest.Validate(); err != nil {
+        return err
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Несоответствие схеме выбрасывает `ManifestInvalid` с путём к файлу и описанием первой ошибки валидации.

@@ -1,0 +1,315 @@
+---
+sidebar_position: 2
+title: ADR-0002 · Hook invocation semantics
+description: Five dispatch classes — singleton / broadcast-collect / broadcast-notify / chain / capability — their normative behaviour, execution order, error handling, and lifecycle ordering.
+slug: /spec/adr/0002-hook-invocation
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0002 · Hook invocation semantics
+
+**Status**: accepted v1.0 (2026-04-16) · [Full normative text](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0002-hook-invocation-semantics.md)
+
+## Why dispatch classes are needed
+
+The base LIFO semantics of any hook dispatcher — "invoke every registered implementation of a hook, collect results into a list" — covers only a small fraction of real scenarios. In practice, different modes are needed:
+
+- **Backend connector** — one active plugin per kind (the current source of truth for data), not all of them at once.
+- **Tool catalogue** — the full list of every tool; if even one is broken, the whole catalogue is broken.
+- **Domain event** — "whoever is interested, let them find out" — fire-and-forget; the failure of one subscriber concerns no one.
+- **Middleware** — a sequential chain where the output of plugin N becomes the input of plugin N+1.
+- **Format-specific handler** — several plugins of a kind, each handling its own input type; the request goes to exactly one suitable plugin.
+
+ADR-0002 normatively fixes **five dispatch classes** and the order of lifecycle calls. Every plugin `kind` declares one of the five classes in its hookspec — and the binding MUST implement it exactly.
+
+## The five classes
+
+### 1. `singleton` — one active plugin
+
+A single plugin handles the whole kind. Algorithm for selecting the active plugin:
+
+1. If the consumer application has set an **explicit routing policy** (for example, a per-tenant group or a blue/green split), it is used.
+2. Otherwise — a global override via the environment variable `DAGSTACK_ACTIVE_<KIND>=<plugin_name>`.
+3. Otherwise — candidates are sorted by `priority desc`, and the highest is chosen.
+4. With equal `priority` and no override — `AmbiguousPlugin`; the core does not start.
+
+**Return**: the first non-empty result. If everyone returned empty — `KindUnknown` / `NoCapableHandler`.
+
+**Use cases**: backend connectors, orchestrators, any kind with "one active".
+
+### 2. `broadcast_collect` — all, with aggregation
+
+All active plugins of a kind are invoked. Results are collected into an **array** in `priority desc` order, with ties broken by name.
+
+**Error policy — fail-fast by default**: a failure in one plugin breaks the whole collect; the caller receives the error and the plugin is marked `degraded`. For a specific kind this MAY be overridden to `best_effort` in the hookspec metadata — failures are then skipped and a partial result is returned.
+
+**Use cases**: tool catalogues, metrics exporters, capability providers.
+
+### 3. `broadcast_notify` — fire-and-forget
+
+All plugins are notified in parallel. Return values are **not collected**. A failure of an individual plugin is logged as `plugin=X error=...` and is not propagated up.
+
+**Return**: void / None.
+
+**Use cases**: lifecycle events (`on_started`, `on_request`, `on_error`), telemetry events, audit hooks.
+
+### 4. `chain` — sequential chain
+
+`output[N]` is passed in as `input[N+1]`. Strict linear order by `priority desc`. The chain is interrupted by returning a kind-specific sentinel (for example, `STOP_CHAIN` in the Python implementation) or by raising an exception.
+
+**Constraint**: chain hooks MUST be **RPC-safe** (capable of executing through MCP). Streams and complex cyclic objects are not supported; the contract test verifies this.
+
+**Use cases**: middleware (request rewriting, post-processing, re-ranking of search results).
+
+### 5. `capability` — capability-based dispatch
+
+Several plugins of a kind, each able to handle a specific subset of inputs. Exactly **one** matching plugin receives the request (unlike `singleton`, where one plugin owns the entire kind, and unlike `broadcast_*`, where every plugin is invoked).
+
+**Capability declaration in the manifest**:
+
+```toml
+[plugin]
+kind = "file_processor"
+name = "format-a-handler"
+supports_languages = ["format-a"]
+supports_extensions = [".fmta"]
+supports_mime_types = ["application/x-format-a"]
+priority = 60
+fallback = false   # exactly one plugin per kind MAY have fallback=true
+```
+
+**Algorithm**:
+
+1. Filter candidates: every plugin of the kind whose `supports_*` entries match the input on at least one entry.
+2. If there are no candidates — look for a plugin with `fallback = true`; if none exists — `DispatchError` (the equivalent of HTTP 422).
+3. With multiple candidates — sort by `priority desc`, with ties broken by name.
+4. Return the first one.
+
+The `capability → plugin` index is built by the registry once at startup; plugin selection is an O(1) lookup.
+
+**Fallback plugin contract**: it **MUST** correctly handle any valid input of its kind without raising. Every edge case (empty input, broken UTF-8, binary data, large size, permission denied) MUST be handled gracefully, returning `[]` or a skip signal. Otherwise a non-matching input crashes the entire processing chain. The base contract-test framework automatically checks the fallback against a curated set of edge-case inputs.
+
+### Singleton vs capability comparison
+
+| | `singleton` | `capability` |
+|---|---|---|
+| What the plugin knows | the whole kind (all inputs) | only a subset (its capability) |
+| Active selection | one for the whole kind | different plugins for different inputs |
+| New implementation | replaces the kind's entire logic | added without conflict |
+| Typical kind | backend connector, orchestrator | file processor, format-specific handler |
+
+## Example: one `kind` with different classes
+
+Below, the same plugin kind (`embedder` — produces vector representations of text) is declared in different dispatch classes depending on the scenario.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="Singleton — one active embedder per application"
+    # The kind's dispatch_class is declared in the hookspec, not in the manifest.
+    embedder = registry.get_plugin("embedder", name="openai_compatible")
+    vectors = embedder.embed(texts=["hello", "world"])
+    ```
+
+    ```python title="Broadcast-collect — gather from every available model"
+    from dagstack.plugin_system import BroadcastCollectDispatcher
+
+    dispatcher = BroadcastCollectDispatcher(registry)
+    # The dispatch class for the hook is provided per call (kind, hook_name).
+    results, errors = dispatcher.dispatch(
+        "metric_exporter", "on_request_finished", ctx, duration_ms=42,
+    )
+    if errors is not None:
+        for plugin_name, exc in errors.errors:
+            ctx.logger.warning("metric exporter %s failed: %s", plugin_name, exc)
+    # results = [from prometheus_exporter, from statsd_exporter, from log_exporter]
+    ```
+
+    ```python title="Capability — pick an embedder for a specific language"
+    from dagstack.plugin_system import CapabilityDispatcher
+
+    # In the manifest: supports_languages = ["python", "typescript"]
+    dispatcher = CapabilityDispatcher(registry)
+    vectors = dispatcher.dispatch(
+        "embedder", "embed", ctx,
+        input={"language": "python", "text": "..."},
+    )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { SingletonDispatcher } from "@dagstack/plugin-system";
+
+    // Singleton dispatch — one active plugin per kind.
+    // Selection: priority desc, ambiguous on tie.
+    const dispatcher = new SingletonDispatcher("payment_provider");
+    const result = await dispatcher.dispatch(
+      registry.getLoadedPlugins(),
+      "charge",
+      { amountCents: 1999, currency: "USD" },
+    );
+    ```
+
+    See the [Dispatcher guides](/docs/guides/dispatchers/singleton) for all five dispatch classes.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="Singleton — one active embedder per kind"
+    // The dispatcher narrows the resolved plugin to the domain interface so
+    // call sites do not type-assert on every invocation.
+    embedderDispatch := pluginsystem.NewDispatchSingleton[Embedder](reg, "embedder")
+    embedder, err := embedderDispatch.Resolve()
+    if err != nil { return err }
+    vectors, err := embedder.Embed(ctx, []string{"hello", "world"})
+    ```
+
+    ```go title="Broadcast-collect — gather from every available exporter"
+    exporters := pluginsystem.NewDispatchBroadcastCollect(reg, "metric_exporter")
+
+    // The handler is the actual hook call site — extract the typed method on
+    // each plugin instance and invoke it. Errors are captured per plugin in
+    // CollectResult.Err; the loop is not aborted by an individual failure.
+    results := exporters.Dispatch(ctx, func(ctx context.Context, p pluginsystem.Plugin) (any, error) {
+        exp, ok := p.Unwrap().(MetricExporter)
+        if !ok {
+            return nil, fmt.Errorf("plugin does not satisfy MetricExporter")
+        }
+        return exp.OnRequestFinished(ctx, RequestEvent{DurationMs: 42})
+    })
+    for _, r := range results {
+        if r.Err != nil {
+            slog.Warn("metric exporter failed", "plugin", r.PluginName, "err", r.Err)
+        }
+    }
+    ```
+
+    ```go title="Capability — pick an embedder for a specific language"
+    // Each plugin participates by implementing pluginsystem.MatchPlugin so its
+    // Matches(ctx, args...) bool method declares which inputs it claims.
+    embedderCap := pluginsystem.NewDispatchCapability(reg, "embedder")
+    plugin, err := embedderCap.Resolve(func(p pluginsystem.Plugin) bool {
+        m, ok := p.(pluginsystem.MatchPlugin)
+        return ok && m.Matches(pluginCtx, "language", "python")
+    })
+    if err != nil {
+        // errors.Is(err, pluginsystem.ErrNoCapabilityMatch) — no plugin matched.
+        return err
+    }
+    vectors, _ := plugin.Unwrap().(Embedder).Embed(ctx, texts)
+    ```
+  </TabItem>
+</Tabs>
+
+## When to choose which class
+
+| Situation | Class |
+|---|---|
+| One active "backend" per kind | `singleton` |
+| Collect a list/catalogue from all (tools, metrics) | `broadcast_collect` |
+| An event with N independent subscribers | `broadcast_notify` |
+| Middleware with data transformation | `chain` |
+| Implementations specialised by input type (extension, language, MIME) | `capability` |
+
+## Lifecycle call order
+
+Lifecycle methods (`setup`, `teardown`, `health`) are invoked directly on plugin instances, not through a dispatcher. They have their own normative order.
+
+### Setup order
+
+1. **By runtime**: `in_process` → `mcp_stdio` → `mcp_http`. Fast and reliable first; networked last so their timeouts do not block the others.
+2. **Topological sort** by `depends_on` from the manifest.
+3. With equal dependencies — by `priority desc`, then by name.
+4. Within a single topological group — in parallel, with a per-plugin `startup_timeout` (30 seconds by default).
+
+### Partial failure — continue, not fail-fast
+
+If a plugin's `setup` fails or exceeds its timeout:
+
+- the plugin is marked `unavailable` with the reason recorded;
+- everything that lists the failed plugin in `depends_on` is **recursively** marked `unavailable`;
+- the remaining groups continue setup;
+- the core starts in a degraded mode; the list of `unavailable` plugins is exposed through the administrative API;
+- fast-failing the entire group on a single failure is unstable in distributed scenarios (especially `mcp_http`); continue-on-failure is more pragmatic for production.
+
+### Teardown order
+
+- **Reverse** of setup: a plugin that others depend on is stopped last.
+- Per-plugin `teardown_timeout` (15 seconds by default).
+- If teardown does not complete in time, the operation is cancelled, the plugin is marked `leaked`, and the core's shutdown continues. For `mcp_*` runtimes — `SIGTERM` → 5s → `SIGKILL`. Leaked plugins block hot-reload until the core is restarted.
+
+### Health checks
+
+In parallel, independently, periodically (30 seconds per plugin by default). A failure moves the plugin into `degraded` with retry. Several consecutive failures — `unavailable` plus an alert.
+
+## Manifest additions
+
+ADR-0002 extends the manifest schema from ADR-0001:
+
+```toml
+[plugin]
+# ... base fields from ADR-0001 ...
+
+priority = 50                                # 0-100, default 0. Higher = earlier/more important.
+depends_on = ["plugin-a", "plugin-b"]        # plugin names
+tryfirst = false                             # forced to run first (debug/override)
+trylast = false                              # forced to run last (cleanup)
+startup_timeout_sec = 30
+teardown_timeout_sec = 15
+
+# Fields for capability dispatch:
+supports_languages = []
+supports_extensions = []
+supports_mime_types = []
+fallback = false
+```
+
+`tryfirst` / `trylast` are escape hatches for debugging and manual override, not a replacement for `priority` + `depends_on` in production. Setting `tryfirst=true` and `trylast=true` simultaneously is a manifest validation error.
+
+## priority vs consumer routing policies
+
+These are **two different axes** that do not compete:
+
+- **`priority` in the manifest** — used for lifecycle ordering (setup/shutdown/broadcast order) and as a tie-break in `singleton` / `capability` when neither an explicit override nor a routing policy applies.
+- **Application routing policies** (per-tenant groups, blue/green, canary) **override** `priority` for runtime selection in `singleton` / `capability` when the relevant context is active.
+
+If a routing policy is active for the kind, the manifest's `priority` does **not** participate in runtime selection.
+
+## Conflict resolution
+
+| Conflict | Behaviour |
+|---|---|
+| `singleton` ambiguity (equal priority, no override, no routing) | `AmbiguousPlugin` — the core does not start. The error names the env variable that resolves it. |
+| Dependency cycle (A → B → A) | `DependencyCycle` — the core does not start. |
+| `depends_on` references a missing plugin | The dependent plugin is marked `unavailable`; the rest of the system runs. |
+| Two `fallback = true` in one kind | `AmbiguousPlugin` — the core does not start. |
+
+## Consequences
+
+**Positive:**
+
+- A single `kind` MAY evolve from `singleton` (one implementation) to `capability` (several specialised ones) without a breaking change: the existing implementation declares all its capabilities explicitly and becomes the fallback.
+- Lifecycle ordering is normative — behaviour in edge cases (failed dependencies, timeouts) is predictable across all implementations.
+- `priority` and `routing-policy` do not compete — an application MAY keep a static `priority` in manifests while still dynamically switching active plugins through a policy.
+
+**Trade-offs:**
+
+- Dispatch classes cannot be mixed inside a single kind — a kind picks exactly one class. Mixed scenarios ("collect from everyone, but fall back if no one answered") require decomposition into two kinds.
+- Continue-on-failure for setup makes debugging harder: a skipped plugin MAY remain unnoticed until the first call. This is mitigated by an admin API listing `unavailable` plugins, mandatory for any production setup.
+
+**What this ADR forbids:**
+
+- A binding cannot silently change the semantics of a class (for example, `broadcast_collect` to fire-and-forget): the classes are a closed enum in `_meta/dispatch_classes.yaml`.
+- Two plugins with `fallback = true` in one kind — the core MUST refuse to start and MUST NOT pick "one at random".
+
+## Related ADRs
+
+- [ADR-0001](./0001-core) — the `PluginRegistry` concept that the dispatchers operate on.
+- [ADR-0003](./0003-runtime-invariants) — lifecycle ordering is compatible with the runtime invariants.
+- [ADR-0004](./0004-hookspec) — `dispatch_class` is a hookspec-YAML field, emitted into implementation types.
+- [ADR-0005](./0005-horizontal-hooks) — a middleware layer built on `ChainDispatcher` with `MIDDLEWARE_PRIORITY_THRESHOLD`.
+
+## Normative source
+
+Full text of ADR-0002 with the error-policy formula, contract requirements for fallback plugins, and the table of binding-specific rules: [`plugin-system-spec/adr/0002-hook-invocation-semantics.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0002-hook-invocation-semantics.md).
+
+The closed enum of classes lives in [`_meta/dispatch_classes.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta).

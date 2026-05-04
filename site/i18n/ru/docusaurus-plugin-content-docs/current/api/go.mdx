@@ -1,0 +1,52 @@
+---
+sidebar_position: 3
+title: API Go
+description: Справка по публичному API Go-реализации — появится после выхода первой стабильной версии реализации.
+slug: /api/go
+---
+
+# API Go
+
+:::note В разработке
+Go-реализация `go.dagstack.dev/plugin-system` находится в дорожной карте. Публикация первого релиза — после стабилизации Python-реализации и завершения кросс-языкового тестирования.
+:::
+
+## Целевой интерфейс
+
+Подход к API определён в [ADR-0001](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0001-plugin-architecture-core.md). Ключевые типы в Go-версии:
+
+```go
+package pluginsystem
+
+// Плагин — объект, который реализует Plugin-интерфейс.
+type Plugin interface {
+    Setup(ctx PluginContext) error
+    Teardown() error
+}
+
+// Реестр — хранит загруженные плагины, управляет жизненным циклом.
+type Registry interface {
+    Plugins() []*RegisteredPlugin
+    Get(kind, name string) (Plugin, error)
+    SetupAll() error
+    TeardownAll() error
+}
+
+// Обнаружение — точка входа.
+func Discover(path string, opts ...DiscoverOption) (Registry, error)
+```
+
+## Что будет в справочнике, когда он появится
+
+- Публичные символы из `go.dagstack.dev/plugin-system`.
+- Интерфейсы видов плагинов (`LLM`, `VectorStore`, `Chunker`, `Tool`, ...).
+- Диспетчеры (`BroadcastCollectDispatcher`, `ChainDispatcher`, `CapabilityDispatcher`).
+- Стандартные ресурсы (`Clock`, `Rng`, `BlobStore`, `HTTPClient`) + тестовые реализации.
+- MCP-адаптеры для out-of-process плагинов.
+
+Генерация справочника — `godoc` с выводом в markdown, коммит в `site/docs/api/go/`.
+
+## Альтернативы, пока Go-биндинг недоступен
+
+- **Рассматривать плагины как внешние сервисы через MCP HTTP**. Плагин на Python запускается как отдельный HTTP-сервис, Go-приложение вызывает его через стандартный MCP-клиент.
+- **Использовать gRPC/REST-мосты** с собственной реализацией сериализации манифестов (не рекомендуется — теряется весь контракт).

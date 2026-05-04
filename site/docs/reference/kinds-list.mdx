@@ -1,0 +1,147 @@
+---
+sidebar_position: 2
+title: Built-in plugin kinds
+description: List of kinds normatively fixed in plugin-system-spec — tool, orchestrator. Each entry covers the contract, available hooks, and typical implementations.
+slug: /reference/kinds-list
+---
+
+# Built-in plugin kinds
+
+In v1.0 the spec repository normatively fixes two built-in plugin kinds. Most domain kinds (`llm`, `embedder`, `vector_store`, `chunker`, and so on) are declared by the consuming application.
+
+## `tool`
+
+A function-style plugin: it accepts structured arguments and returns a structured result.
+
+- **Hookspec**: [`kinds/tool/v1.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/kinds/tool)
+- **`kind_api_version`**: `1.0.0`
+- **Typical runtime**: `in_process` or `mcp_stdio`
+
+### Hooks
+
+| Hook | Dispatch | Description |
+|---|---|---|
+| `get_schema` | `broadcast_collect` | Returns the JSON Schema for the plugin's input/output — used by inspector UIs and MCP registration. |
+| `execute` | `singleton` | Runs the tool with the given arguments and returns the result. |
+
+### Typical implementations
+
+- `semantic_search` — searches indexed documents.
+- `http_fetch` — downloads a page by URL.
+- `file_read` / `file_write` — interacts with the file system inside a sandbox directory.
+- `code_execute` — runs code in an isolated environment (usually `mcp_stdio`).
+- `sql_query` — runs a SQL query against a connected database.
+
+### Minimal manifest
+
+```toml
+[plugin]
+schema_version = "1"
+name = "my-tool"
+kind = "tool"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+entry_point = "plugin:MyTool"
+```
+
+## `orchestrator`
+
+Manages the lifecycle of long-running UoWs (units of work) — enqueue, status, backfill. **Singleton**, always `in_process_only` (it cannot live behind MCP because of its state).
+
+- **Hookspec**: [`kinds/orchestrator/v1.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/kinds/orchestrator)
+- **`kind_api_version`**: `1.0.0`
+- **Runtime**: `in_process` only
+
+### Hooks
+
+| Hook | Dispatch | Description |
+|---|---|---|
+| `enqueue` | `singleton` | Enqueues a UoW. Idempotent on `idempotency_key`. Returns `(unit_id, deduplicated)`. |
+| `status` | `singleton` | Returns the current status of a UoW: `(state, started_at?, finished_at?, progress?, error?)`. |
+| `backfill` | `singleton` | Re-enqueues failed/expired units. Returns `(enqueued_count, skipped_count)`. |
+
+### Built-in implementation
+
+Every binding ships with `LocalExecutorOrchestrator` — a mandatory in-tree plugin. Semantics:
+
+- in-process executor: `enqueue` runs the work in the same event loop / thread pool.
+- in-memory queue (or persistent JSON in Phase 0).
+- A real queue (Postgres-based, Redis-based) ships in Phase 1+ via external orchestrator plugins (Dagster wrapper, Celery wrapper).
+
+## Kinds declared by the consuming application
+
+Applications in different domains use different sets of kinds. Kinds are **not normative** — every application declares its own hookspecs. The clusters below are typical starting points.
+
+### Data processing
+
+| Kind | Purpose | Typical dispatch |
+|---|---|---|
+| `source` | Data source (S3, Postgres, Kafka). | `broadcast_collect` (multiple sources) or `capability` (per format) |
+| `processor` | Record transformation / enrichment. | `chain` (pipeline) or `broadcast_collect` |
+| `sink` | Destination store (Elasticsearch, warehouse). | `broadcast_notify` (fan-out) or `singleton` |
+
+### Notifications and integrations
+
+| Kind | Purpose | Typical dispatch |
+|---|---|---|
+| `notifier` | Sends notifications (email, SMS, webhook, push). | `capability` (per channel) or `broadcast_notify` (fan-out) |
+| `auth_provider` | OAuth / SAML / LDAP. | `capability` (per provider type) |
+| `webhook_handler` | Handles incoming webhooks. | `capability` (per event type) |
+
+### Business logic
+
+| Kind | Purpose | Typical dispatch |
+|---|---|---|
+| `payment_provider` | Stripe / PayPal / in-house module. | `capability` (per currency / region) or `singleton` |
+| `tax_calculator` | Computes tax per jurisdiction. | `capability` (per country) |
+| `pricing_strategy` | Pricing rules. | `chain` (applied sequentially) |
+
+### Observability / platform
+
+| Kind | Purpose | Typical dispatch |
+|---|---|---|
+| `metric_exporter` | Exports metrics (Prometheus / OTLP). | `broadcast_collect` or `broadcast_notify` |
+| `audit_logger` | Audit trail of events. | `broadcast_notify` |
+| `event_listener` | Subscriber to lifecycle events. | `broadcast_notify` |
+| `rate_limiter` | Request rate limiting. | `chain` (in the middleware layer) |
+
+### AI / RAG platforms (one possible scenario)
+
+| Kind | Purpose | Typical dispatch |
+|---|---|---|
+| `llm` | Language model — completion, chat, streaming. | `singleton` |
+| `embedder` | Vector representation of text. | `capability` (per language) or `singleton` |
+| `vector_store` | Vector store — upsert / search. | `singleton` |
+| `chunker` | Splits text or code into fragments. | `capability` (per format) |
+| `reranker` | Reranks search results. | `chain` |
+| `tool_provider` | Source of tools for an agent. | `broadcast_collect` |
+
+## Declaring your own kind
+
+If none of the above fits, declare your own — see [Plugin kinds](../concepts/kinds) and [ADR-0004](../spec/adr/0004-hookspec).
+
+Steps:
+
+1. Write a hookspec in `kinds/<name>/v1.yaml`.
+2. Describe a JSON Schema for the inputs and outputs of every hook in `kinds/<name>/schemas/`.
+3. Generate types for your implementation (pydantic / zod / struct).
+4. Register the hookspec at `discover()` via the `kind_hookspecs` parameter.
+
+## Namespace conventions for kind names
+
+The recommended convention (not enforced):
+
+- `snake_case`.
+- Singular nouns: `embedder`, not `embedders`.
+- No version in the name: `llm`, not `llm_v2`. The version belongs in `kind_api_version`.
+- Organisation prefix for non-standard kinds: `acme_internal_scorer` — to avoid clashing with future standard kinds.
+
+## Relationship to dispatch
+
+`kind` does not by itself define dispatch. Dispatch is declared **per hook** in the hookspec. A single kind may have hooks with different dispatch classes (as `tool` does, with `broadcast_collect` for `get_schema` and `singleton` for `execute`).
+
+## See also
+
+- [Plugin kinds](../concepts/kinds) — how to declare your own.
+- [ADR-0004: Hookspec formalism](../spec/adr/0004-hookspec) — YAML format and emitters.
+- [Dispatch classes](../concepts/dispatch) — which one to choose.

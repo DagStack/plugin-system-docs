@@ -1,0 +1,11 @@
+{
+  "label": "Руководства",
+  "position": 3,
+  "collapsible": true,
+  "collapsed": false,
+  "link": {
+    "type": "generated-index",
+    "title": "Руководства",
+    "description": "Практические задачи — написание плагинов, конфигурация, жизненный цикл, тестирование."
+  }
+}

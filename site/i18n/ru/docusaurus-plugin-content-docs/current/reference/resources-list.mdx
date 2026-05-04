@@ -1,0 +1,297 @@
+---
+sidebar_position: 5
+title: Стандартные ресурсы
+description: Полный перечень стандартных ресурсов plugin-system — интерфейсы, реальные и тестовые реализации, порядок жизненного цикла.
+slug: /reference/resources-list
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Стандартные ресурсы
+
+Plugin-system v1.0 фиксирует пять стандартных ресурсов, доступных в `PluginContext.resources`. Каждый — протокол (`Protocol` в Python, `interface` в TS/Go); конкретные реализации — в рамках соответствующего binding-пакета.
+
+Концептуальный обзор — на странице [Ресурсы (Resources DI)](../concepts/resources). Здесь — точные сигнатуры и доступные реализации.
+
+## `clock`
+
+Инъектируемый источник времени. Обязателен для плагинов с `idempotency_mode = "output_hash"` (инвариант 8).
+
+### Интерфейс
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from typing import Protocol
+    from datetime import datetime
+
+
+    class Clock(Protocol):
+        def now(self) -> datetime:
+            """Current time. Takes no arguments."""
+
+        def monotonic_ns(self) -> int:
+            """Monotonic counter in nanoseconds, used to measure intervals."""
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    export interface Clock {
+      now(): Date;
+      monotonicNs(): bigint;
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type Clock interface {
+        Now() time.Time
+        MonotonicNs() int64
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Реализации
+
+| Имя | Где | Поведение |
+|---|---|---|
+| `SystemClock` | production | Возвращает реальное время системы. |
+| `FrozenClock(now)` | тесты | Возвращает фиксированное время, не меняется (если не вызван `advance()`). |
+
+## `rng`
+
+Инъектируемый источник случайности. Обязателен для плагинов с `idempotency_mode = "output_hash"`.
+
+### Интерфейс
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class Rng(Protocol):
+        def next_float(self) -> float:
+            """[0.0, 1.0)"""
+
+        def next_int(self, low: int, high: int) -> int:
+            """[low, high]"""
+
+        def uuid4(self) -> str:
+            """A random UUID v4."""
+
+        def choice(self, items: list) -> any:
+            """A random element of the list."""
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    export interface Rng {
+      nextFloat(): number;            // [0.0, 1.0)
+      nextInt(low: number, high: number): number;
+      uuid4(): string;
+      choice<T>(items: T[]): T;
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type Rng interface {
+        NextFloat() float64
+        NextInt(low, high int) int
+        UUID4() string
+        Choice(items []any) any
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Реализации
+
+| Имя | Где | Поведение |
+|---|---|---|
+| `RandomRng` | production | Источник — OS (`os.urandom` в Python, `crypto.randomBytes` в Node, `crypto/rand` в Go). |
+| `DeterministicRng(seed)` | тесты | Seeded PRNG (например, PCG). Воспроизводимый поток. |
+
+## `http_client`
+
+Инъектируемый HTTP-клиент, предконфигурированный хостом (CA-bundle, TLS, таймауты, retry-политика).
+
+### Интерфейс
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class HttpClient(Protocol):
+        async def get(self, url: str, *, headers: dict = None) -> HttpResponse: ...
+        async def post(self, url: str, *, json: dict = None, headers: dict = None) -> HttpResponse: ...
+        async def put(self, url: str, *, json: dict = None, headers: dict = None) -> HttpResponse: ...
+        async def delete(self, url: str, *, headers: dict = None) -> HttpResponse: ...
+
+    class HttpResponse(Protocol):
+        status_code: int
+        headers: dict[str, str]
+        def json(self) -> any: ...
+        def text(self) -> str: ...
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    export interface HttpClient {
+      get(url: string, init?: RequestInit): Promise<HttpResponse>;
+      post(url: string, body: unknown, init?: RequestInit): Promise<HttpResponse>;
+      put(url: string, body: unknown, init?: RequestInit): Promise<HttpResponse>;
+      delete(url: string, init?: RequestInit): Promise<HttpResponse>;
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type HTTPClient interface {
+        Get(url string, headers map[string]string) (*HTTPResponse, error)
+        Post(url string, body any, headers map[string]string) (*HTTPResponse, error)
+        Put(url string, body any, headers map[string]string) (*HTTPResponse, error)
+        Delete(url string, headers map[string]string) (*HTTPResponse, error)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Реализации
+
+| Имя | Где | Поведение |
+|---|---|---|
+| `HttpClient` (production) | production | Обёртка над нативным HTTP-клиентом языка (`httpx.AsyncClient` в Python, `fetch` в TS, `net/http.Client` в Go) с host-конфигом. |
+
+:::info Reference test implementation в Phase 2
+В `0.1.x` готовая тестовая реализация `HttpClient` ещё не входит в публичный API ни одного биндинга. Тесты подключают свою реализацию, удовлетворяющую протоколу `HttpClient` (тривиальный класс с предопределёнными ответами). Стандартный набор тестовых фейков для `HttpClient` появится в Phase 2.
+:::
+
+## `blob_store`
+
+Абстрактное хранилище блобов (байтовых объектов).
+
+### Интерфейс
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    class BlobStore(Protocol):
+        async def put(self, key: str, data: bytes, *, content_type: str = None) -> None: ...
+        async def get(self, key: str) -> bytes: ...
+        async def delete(self, key: str) -> None: ...
+        async def list(self, prefix: str = "") -> list[str]: ...
+        async def exists(self, key: str) -> bool: ...
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    export interface BlobStore {
+      put(key: string, data: Uint8Array, options?: { contentType?: string }): Promise<void>;
+      get(key: string): Promise<Uint8Array>;
+      delete(key: string): Promise<void>;
+      list(prefix?: string): Promise<string[]>;
+      exists(key: string): Promise<boolean>;
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type BlobStore interface {
+        Put(key string, data []byte, contentType string) error
+        Get(key string) ([]byte, error)
+        Delete(key string) error
+        List(prefix string) ([]string, error)
+        Exists(key string) (bool, error)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Реализации
+
+| Имя | Где | Поведение |
+|---|---|---|
+| `FileBlobStore(root)` | dev / in-process | Хранит файлы в локальной папке. |
+| `S3BlobStore(bucket, client)` | production (Phase 1+) | S3-совместимый backend. |
+| `InMemoryBlobStore` | тесты | `dict[str, bytes]` в памяти, cleanup на teardown. |
+
+## `tmpdir`
+
+Временная директория с автоочисткой.
+
+### Интерфейс
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from pathlib import Path
+    from typing import Protocol
+
+
+    class TempDir(Protocol):
+        path: Path
+        def create_file(self, name: str, *, suffix: str = "") -> Path: ...
+        def create_subdir(self, name: str) -> Path: ...
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    export interface TempDir {
+      readonly path: string;
+      createFile(name: string, suffix?: string): Promise<string>;
+      createSubdir(name: string): Promise<string>;
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    type TempDir interface {
+        Path() string
+        CreateFile(name, suffix string) (string, error)
+        CreateSubdir(name string) (string, error)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Реализации
+
+| Имя | Где | Поведение |
+|---|---|---|
+| `SystemTempDir` | production | Создаёт директорию в `os.tempdir()`, удаляет на `teardown`. |
+| `InMemoryTempDir` | тесты | Виртуальная ФС в памяти (например, через `pyfakefs`). |
+
+## Кастомные ресурсы
+
+Приложение регистрирует любые собственные ресурсы через `ResourceRegistry`:
+
+```python
+resources.register("postgres", await create_pg_pool())
+resources.register("tenant_registry", TenantRegistryImpl(...))
+resources.register("rate_limiter", RateLimiter(...))
+```
+
+Плагин объявляет их в манифесте (`resources.required` / `resources.optional`), получает через `ctx.resources.postgres`, `ctx.resources.tenant_registry` и т.д.
+
+Имена кастомных ресурсов — на усмотрение приложения; соглашение — `snake_case`.
+
+## Lifecycle
+
+1. **Application startup**: host создаёт `ResourceRegistry`, заполняет стандартными и кастомными ресурсами.
+2. **`discover()`**: ресурсы передаются в реестр через параметр `resources=`.
+3. **`setup()` каждого плагина**: плагин читает нужные ресурсы из `ctx.resources.*`.
+4. **Работа приложения**: плагин использует ресурсы в хуках.
+5. **`teardown()` каждого плагина**: плагин может освободить всё, что создал поверх ресурсов (но не сами ресурсы — они принадлежат хосту).
+6. **Application shutdown**: host закрывает ресурсы (БД-пулы, HTTP-клиенты) уже после всех `teardown()`-вызовов.
+
+## Требования к реализациям ресурсов
+
+- **Thread-safe / goroutine-safe**. Ресурсы — синглтоны на host, доступны нескольким плагинам одновременно.
+- **Протокольно типизированы**. Интерфейс обязан быть формально специфицирован.
+- **Идемпотентно закрываемы**. Повторный close не бросает.
+
+## См. также
+
+- [Ресурсы (Resources DI)](../concepts/resources) — концептуальный обзор.
+- [Инварианты runtime](../concepts/invariants) — инвариант 3 «Resources DI».
+- [ADR-0003 §3 Resources DI](../spec/adr/0003-runtime-invariants) — нормативный контракт.

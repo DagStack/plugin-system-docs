@@ -1,0 +1,11 @@
+{
+  "label": "Справочник API",
+  "position": 4,
+  "collapsible": true,
+  "collapsed": true,
+  "link": {
+    "type": "generated-index",
+    "title": "Справочник API",
+    "description": "Авто-генерируемая справка по публичному API для каждой из языковых реализаций."
+  }
+}

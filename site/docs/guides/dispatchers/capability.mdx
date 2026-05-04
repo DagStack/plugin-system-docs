@@ -1,0 +1,324 @@
+---
+sidebar_position: 5
+title: Capability
+description: End-to-end walkthrough for the capability class — dispatch by input type, supports_* declarations, fallback, contract requirements for the fallback plugin.
+slug: /guides/dispatchers/capability
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Capability — routing a request to a specialised plugin
+
+`capability` — several plugins of the kind, each handling its own subset of inputs; exactly one plugin receives the request. Typical uses: file processors for different formats, language-specific parsers, specialised handlers with a fallback.
+
+## Scenario: a semantic chunker with fallback
+
+The application has a code indexer; it must split files into semantically meaningful fragments. For Python / TypeScript / Go we use a Tree-sitter-based chunker; for the remaining formats — a simple length-based fallback.
+
+### The kind's hookspec
+
+```yaml title="kinds/chunker/v1.yaml"
+kind: chunker
+kind_api_version: 1.0.0
+description: Splitting text into fragments.
+
+hooks:
+  - name: chunk
+    dispatch: capability
+    description: Split the text.
+    input_schema: schemas/chunk_input.json
+    output_schema: schemas/chunk_output.json
+    mcp_exposed: true
+```
+
+The hookspec declares the `capability` dispatcher, but **how** to route (which input fields → which `supports_*`) is decided by the application via a capability matcher; the details live in `_meta/capability_matchers.yaml` or in the consumer application.
+
+### Specialised plugins
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```toml title="plugins/chunker/tree-sitter/dagstack.toml"
+    [plugin]
+    name = "tree-sitter"
+    kind = "chunker"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 50
+    supports_languages = ["python", "typescript", "javascript", "go", "java", "ruby"]
+    supports_extensions = [".py", ".ts", ".js", ".go", ".java", ".rb"]
+    ```
+
+    ```python title="plugins/chunker/tree-sitter/plugin.py"
+    from tree_sitter import Parser
+
+    SUPPORTED_LANGUAGES = {"python", "typescript", "javascript", "go", "java", "ruby"}
+
+
+    class TreeSitterChunker:
+        async def setup(self, ctx):
+            self._parsers = {
+                "python": Parser(PYTHON_LANG),
+                "typescript": Parser(TS_LANG),
+                # ...
+            }
+
+        def matches(self, payload: dict) -> bool:
+            # CapabilityDispatcher consults this method to decide whether the plugin
+            # can handle the given input.
+            return payload.get("language") in SUPPORTED_LANGUAGES
+
+        def chunk(self, ctx, payload: dict) -> dict:
+            parser = self._parsers[payload["language"]]
+            tree = parser.parse(payload["content"].encode())
+            return {
+                "chunks": [
+                    {"text": node.text.decode(), "line_start": node.start_point[0]}
+                    for node in _walk_top_level_nodes(tree.root_node)
+                ],
+            }
+    ```
+
+    ```toml title="plugins/chunker/fixed/dagstack.toml"
+    [plugin]
+    name = "fixed"
+    kind = "chunker"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 10
+    fallback = true
+    ```
+
+    ```python title="plugins/chunker/fixed/plugin.py"
+    class FixedChunker:
+        """Fallback: splits arbitrary text into fixed-length pieces."""
+
+        async def setup(self, ctx):
+            pass
+
+        def matches(self, payload: dict) -> bool:
+            # The fallback declares it can handle anything; capability matchers
+            # will still pick a more specific plugin first thanks to priority.
+            return True
+
+        def chunk(self, ctx, payload: dict) -> dict:
+            text = payload["content"]
+            size = 512
+            chunks = [
+                {"text": text[i:i + size], "offset": i}
+                for i in range(0, len(text), size)
+            ]
+            return {"chunks": chunks}
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```json title="plugins/chunker/tree-sitter/dagstack.json"
+    {
+      "plugin": {
+        "name": "tree-sitter",
+        "kind": "chunker",
+        "runtime": "in_process",
+        "core_version": "^0.2",
+        "priority": 50,
+        "supports_languages": ["typescript", "javascript"],
+        "supports_extensions": [".ts", ".js"]
+      }
+    }
+    ```
+
+    ```ts title="plugins/chunker/tree-sitter/plugin.ts"
+    export class TreeSitterChunker {
+      chunk(input: ChunkInput): ChunkOutput {
+        const tree = this.parser.parse(input.content);
+        return {
+          chunks: walkTopLevelNodes(tree.rootNode).map((node) => ({
+            text: node.text,
+            line_start: node.startPosition.row,
+          })),
+        };
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```toml title="plugins/chunker/tree-sitter/dagstack.toml"
+    [plugin]
+    name = "tree-sitter"
+    kind = "chunker"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 50
+    supports_languages = ["go", "rust"]
+    supports_extensions = [".go", ".rs"]
+    ```
+
+    ```go title="plugins/chunker/tree-sitter/plugin.go"
+    package treesitter
+
+    import "context"
+
+    type TreeSitterChunker struct {
+        supported map[string]struct{}
+        parser    Parser
+    }
+
+    func (p *TreeSitterChunker) Supports(language string) bool {
+        _, ok := p.supported[language]
+        return ok
+    }
+
+    func (p *TreeSitterChunker) Chunk(ctx context.Context, input ChunkInput) (ChunkOutput, error) {
+        tree := p.parser.Parse(nil, []byte(input.Content))
+        chunks := walkTopLevel(tree.RootNode())
+        return ChunkOutput{Chunks: chunks}, nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Calling the dispatcher
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import CapabilityDispatcher
+
+    dispatcher = CapabilityDispatcher(registry)
+
+    # Python file → tree-sitter (matches() returns True for language="python")
+    plugin = dispatcher.dispatch(
+        "chunker", "chunk", ctx,
+        payload={"language": "python", "content": "def hello(): ..."},
+    )
+    result = plugin.chunk(ctx, {"language": "python", "content": "def hello(): ..."})
+
+    # Markdown file → fixed (only the fallback's matches() returns True)
+    plugin = dispatcher.dispatch(
+        "chunker", "chunk", ctx,
+        payload={"extension": ".md", "content": "# Hello\n..."},
+    )
+    result = plugin.chunk(ctx, {"extension": ".md", "content": "# Hello\n..."})
+    ```
+
+    The `CapabilityDispatcher.dispatch()` method **returns the selected plugin instance**; the caller invokes the kind-specific hook on it. There is no built-in "execute and return result" convenience.
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { CapabilityDispatcher } from "@dagstack/plugin-system";
+
+    type ChunkPayload = { language?: string; extension?: string; content: string };
+    type ChunkResult = { chunks: string[] };
+
+    const dispatcher = new CapabilityDispatcher<ChunkPayload, ChunkResult>("chunker");
+
+    // Python file → tree-sitter wins (declares capability "lang:python")
+    const result = await dispatcher.dispatch(
+      registry.getLoadedPlugins(),
+      "chunk",
+      {
+        language: "python",
+        content: "def hello(): ...",
+        capabilities: { required: ["lang:python"] },
+      },
+    );
+
+    // Markdown file → falls back to the `fallback: true` plugin
+    const fallbackResult = await dispatcher.dispatch(
+      registry.getLoadedPlugins(),
+      "chunk",
+      {
+        extension: ".md",
+        content: "# Hello\n...",
+        capabilities: { required: [] },
+      },
+    );
+    ```
+
+    Note: TypeScript's `CapabilityDispatcher.dispatch` calls the hook directly and returns its result; unlike the Python `dispatch()` (which returns the selected plugin for the caller to invoke), the TS variant pre-selects and invokes in one step.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    capDisp := pluginsystem.NewDispatchCapability(reg, "chunker")
+
+    input := ChunkInput{Language: "go", Content: "func Hello() { ... }"}
+    plugin, err := capDisp.Resolve(func(p pluginsystem.Plugin) bool {
+        return p.Unwrap().(Chunker).Supports(input.Language)
+    })
+    if err != nil {
+        return err
+    }
+    result, err := plugin.Unwrap().(Chunker).Chunk(ctx, input)
+    ```
+
+    `Resolve` returns a `pluginsystem.Plugin` — call `Unwrap()` and assert to the kind contract. The matcher closure runs in `priority desc` order over the plugins of the kind; the first one whose closure returns `true` wins.
+  </TabItem>
+</Tabs>
+
+## The plugin selection algorithm
+
+```
+dispatch(kind, input) → plugin
+  1. Filter plugins of the kind whose supports_* match the input fields.
+  2. If there are no candidates → the plugin with fallback = true.
+     If there is no fallback either → DispatchError (HTTP 422 equivalent).
+  3. If there is more than one candidate → priority desc, ties by name.
+  4. Return the first one.
+```
+
+The plugin author only declares `supports_*` in the manifest. The core builds the `capability → plugins` index once at startup — picking a plugin for a request is an O(1) lookup.
+
+## Fallback plugin contract
+
+The fallback **must** handle **any** valid input of the kind — without raising. All edge cases (empty input, broken encoding, binary data, very large size) return a correct result (possibly empty or a skip signal), not an unhandled exception.
+
+The base contract test framework checks this automatically — running the fallback through a curated set of edge-case inputs. If any one call yields an unhandled exception, the test fails.
+
+**Exactly one** plugin of the kind may have `fallback = true`. Two fallbacks → `AmbiguousPlugin` at startup, the core does not start.
+
+## Extending without a breaking change
+
+Adding a new specialised plugin (for example, `rust-chunker` with `supports_languages = ["rust"]`):
+
+1. Create the folder, `dagstack.toml`, `plugin.py`.
+2. The manifest with `supports_languages = ["rust"]`.
+3. **No changes** in the existing plugins, in the fallback, or in the code that calls the dispatcher.
+
+Rust files that previously fell through to the `fixed` fallback now go to `rust-chunker`.
+
+## Governance filtering
+
+Via the horizontal extensions mechanism (see [ADR-0005 §4](../../spec/adr/0005-horizontal-hooks)), the host can constrain the set of permitted plugins for a particular tenant:
+
+```
+governance policy:
+  tenant="acme-healthcare" allowed_plugins where capability ⊇ {"pii_handling"}
+```
+
+For that tenant the dispatcher narrows the candidates before capability matching — to plugins that declared the `pii_handling` capability only.
+
+## Common errors
+
+| Symptom | Cause |
+|---|---|
+| `DispatchError: no handler for input` | No plugin has a matching capability and there is no fallback. Add a plugin or set `fallback = true` on one of the existing ones. |
+| `AmbiguousPlugin: two plugins with fallback = true` | Two plugins of the kind have `fallback = true`. Resolve — keep exactly one fallback. |
+| Fallback is picked even though a specialised plugin exists | Check `supports_*` in the specialised plugin's manifest; there may be a typo in the language or extension name. |
+| Fallback fails on a particular input | The fallback contract is broken; fix the edge-case handling and re-check through the contract suite. |
+
+## When capability is the wrong fit
+
+- **You need every plugin at once** — use `broadcast-collect`.
+- **Implementations replace one another, they do not specialise** — use `singleton`.
+- **You need sequential processing** — use `chain`.
+
+## See also
+
+- [Dispatch](../../concepts/dispatch) — overview of all classes.
+- [ADR-0002 §5 capability](../../spec/adr/0002-hook-invocation) — the normative contract plus the selection algorithm.
+- [ADR-0005 §4 governance filtering](../../spec/adr/0005-horizontal-hooks) — narrowing candidates via policy.

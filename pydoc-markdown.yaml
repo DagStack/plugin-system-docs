@@ -1,0 +1,43 @@
+# Конфигурация авто-генерации Python API-справочника.
+# Запуск: make api-python  (эквивалент `pydoc-markdown`).
+#
+# Требование: пакет dagstack-plugin-system должен быть установлен в активное
+# окружение (virtualenv / uv-venv). Скрипт читает публичный API пакета через
+# механизм pydoc и рендерит его в набор .mdx-страниц для Docusaurus.
+#
+# Выход: site/docs/api/python/*.mdx. Файлы коммитятся в репозиторий (не в CI
+# artifacts), чтобы страница справки была видна сразу после клонирования.
+
+loaders:
+  - type: python
+    # search_path читается из переменной окружения PYDOC_SEARCH_PATH; при её
+    # отсутствии пакет ищется по стандартному sys.path текущего Python-окружения
+    # (нужен активный venv с установленным dagstack-plugin-system).
+    search_path:
+      - '${PYDOC_SEARCH_PATH:-}'
+    packages:
+      - dagstack.plugin_system
+
+processors:
+  - type: filter
+    skip_empty_modules: true
+  - type: smart
+  - type: crossref
+
+renderer:
+  type: docusaurus
+  docs_base_path: site/docs
+  relative_output_path: api/python
+  relative_sidebar_path: sidebar.json
+  sidebar_top_level_label: Python
+  markdown:
+    use_fixed_header_levels: true
+    header_level_by_type:
+      Module: 2
+      Class: 3
+      Method: 4
+      Function: 4
+      Data: 4
+    descriptive_class_title: false
+    render_module_header: true
+    escape_html_in_docstring: false

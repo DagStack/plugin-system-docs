@@ -1,0 +1,324 @@
+---
+sidebar_position: 4
+title: Chain
+description: End-to-end walkthrough for the chain class — sequential data transformation through a plugin chain, abort, and the middleware pattern.
+slug: /guides/dispatchers/chain
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Chain — a sequential plugin chain
+
+`chain` — plugins line up in a chain by `priority desc`; the input of each plugin is the output of the previous one. Typical uses: request middleware, sequential post-processing, context-aware rewriting.
+
+## Scenario: rewriting a query before vector search
+
+Before vector search, the user's query goes through several stages: normalisation, synonyms, expansion with keywords from the tenant context.
+
+### The kind's hookspec
+
+```yaml title="kinds/query_rewriter/v1.yaml"
+kind: query_rewriter
+kind_api_version: 1.0.0
+description: Query transformer applied before search.
+
+hooks:
+  - name: rewrite
+    dispatch: chain
+    description: Transform the query text.
+    input_schema: schemas/query.json
+    output_schema: schemas/query.json   # input == output — data flows through the chain
+    mcp_exposed: true
+```
+
+### Three plugins in the chain
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```toml title="plugins/query_rewriter/normalizer/dagstack.toml"
+    [plugin]
+    name = "normalizer"
+    kind = "query_rewriter"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 100    # first — basic normalisation
+    ```
+
+    ```python title="plugins/query_rewriter/normalizer/plugin.py"
+    import re
+
+    class Normalizer:
+        async def setup(self, ctx):
+            pass
+
+        def rewrite(self, ctx, query):
+            text = query["text"].lower().strip()
+            text = re.sub(r"\s+", " ", text)
+            return {**query, "text": text}
+    ```
+
+    ```toml title="plugins/query_rewriter/synonymizer/dagstack.toml"
+    [plugin]
+    name = "synonymizer"
+    kind = "query_rewriter"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 50     # after normalisation
+    ```
+
+    ```python title="plugins/query_rewriter/synonymizer/plugin.py"
+    SYNONYMS = {"launch": "start", "setup": "configuration"}
+
+    class Synonymizer:
+        async def setup(self, ctx):
+            pass
+
+        def rewrite(self, ctx, query):
+            text = " ".join(
+                SYNONYMS.get(word, word) for word in query["text"].split()
+            )
+            return {**query, "text": text}
+    ```
+
+    ```toml title="plugins/query_rewriter/tenant-enricher/dagstack.toml"
+    [plugin]
+    name = "tenant-enricher"
+    kind = "query_rewriter"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 10     # last — context enrichment
+    ```
+
+    ```python title="plugins/query_rewriter/tenant-enricher/plugin.py"
+    class TenantEnricher:
+        async def setup(self, ctx):
+            self._tenant_keywords = ctx.registry.resource_registry.get("tenant_keywords")
+
+        def rewrite(self, ctx, query):
+            tenant_id = query.get("tenant_id")
+            if tenant_id is None:
+                return query
+            keywords = self._tenant_keywords.get(tenant_id, [])
+            if keywords:
+                return {**query, "text": query["text"] + " " + " ".join(keywords)}
+            return query
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts title="plugins/query_rewriter/normalizer/plugin.ts"
+    export class Normalizer {
+      rewrite(query: Query): Query {
+        return {
+          ...query,
+          text: query.text.toLowerCase().trim().replace(/\s+/g, " "),
+        };
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugins/query_rewriter/normalizer/plugin.go"
+    package normalizer
+
+    import (
+        "context"
+        "regexp"
+        "strings"
+    )
+
+    var spaceRe = regexp.MustCompile(`\s+`)
+
+    type Normalizer struct{}
+
+    func (p *Normalizer) Rewrite(ctx context.Context, q Query) (Query, error) {
+        q.Text = spaceRe.ReplaceAllString(strings.TrimSpace(strings.ToLower(q.Text)), " ")
+        return q, nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Running the chain
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import ChainDispatcher
+
+    dispatcher = ChainDispatcher(registry)
+
+    original = {"text": "  How to LAUNCH dagstack?  ", "tenant_id": "acme-corp"}
+    rewritten = dispatcher.dispatch(
+        "query_rewriter", "rewrite", ctx, initial_value=original,
+    )
+    # After normalizer:       {"text": "how to launch dagstack?", "tenant_id": "..."}
+    # After synonymizer:      {"text": "how to start dagstack?", ...}
+    # After tenant-enricher:  {"text": "how to start dagstack? microservices python", ...}
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { ChainDispatcher } from "@dagstack/plugin-system";
+
+    type Query = { text: string; tenantId: string };
+
+    const dispatcher = new ChainDispatcher<Query>("query_rewriter");
+
+    const original: Query = { text: "  How to LAUNCH dagstack?  ", tenantId: "acme-corp" };
+    const rewritten = await dispatcher.dispatch(
+      registry.getLoadedPlugins(),
+      "rewrite",
+      original,
+    );
+    // After normalizer:      { text: "how to launch dagstack?", tenantId: "..." }
+    // After synonymizer:     { text: "how to start dagstack?",  ... }
+    // After tenant-enricher: { text: "how to start dagstack? microservices typescript", ... }
+    ```
+
+    `ChainDispatcher` orders plugins as `tryfirst` band → normal band → `trylast` band, with `priority desc` inside each band and registration order on ties (pluggy semantics).
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    chain := pluginsystem.NewDispatchChain(reg, "query_rewriter")
+    final, err := chain.Dispatch(ctx, Query{
+        Text:     "  How to LAUNCH dagstack?  ",
+        TenantID: "acme-corp",
+    }, func(ctx context.Context, p pluginsystem.Plugin, v any) (any, error) {
+        return p.Unwrap().(QueryRewriter).Rewrite(ctx, v.(Query))
+    })
+    if err != nil {
+        return err
+    }
+    rewritten := final.(Query)
+    ```
+
+    `Dispatch` walks the plugins of the kind in `priority desc` order, threading the value through each step. The closure receives the previous step's output and returns the next step's input. Stop early by returning `pluginsystem.StopChain` from the closure.
+  </TabItem>
+</Tabs>
+
+## Aborting the chain
+
+A plugin can abort the chain early — by returning a sentinel or by raising an exception:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import STOP_CHAIN
+
+    class Blacklist:
+        """Blocks queries containing forbidden words — returns STOP_CHAIN."""
+
+        BANNED = {"delete_database", "rm -rf"}
+
+        async def setup(self, ctx):
+            pass
+
+        def rewrite(self, ctx, query):
+            if any(bad in query["text"].lower() for bad in self.BANNED):
+                return STOP_CHAIN  # subsequent plugins are not invoked
+            return query
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts title="plugins/blacklist/plugin.ts"
+    type Query = { text: string; tenantId: string };
+
+    /**
+     * Blocks queries containing forbidden words. The TS `ChainDispatcher`
+     * does not implement a `STOP_CHAIN` sentinel today — abort the chain
+     * by throwing an error; callers wrap `dispatch()` in try/catch.
+     */
+    export class Blacklist {
+      private static readonly BANNED = ["delete_database", "rm -rf"];
+
+      async setup(): Promise<void> {}
+
+      rewrite(query: Query): Query {
+        const lower = query.text.toLowerCase();
+        if (Blacklist.BANNED.some((bad) => lower.includes(bad))) {
+          throw new Error("Query blocked by blacklist");
+        }
+        return query;
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    package blacklist
+
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type Blacklist struct{}
+
+    // The signature returns `any` so the chain dispatcher can short-circuit on
+    // `pluginsystem.StopChain`. The closure passed to `chain.Dispatch` returns
+    // this value verbatim — the dispatcher detects the sentinel via
+    // `pluginsystem.IsStopChain` and stops the chain.
+    func (p *Blacklist) Rewrite(ctx context.Context, q Query) (any, error) {
+        if containsBanned(q.Text) {
+            return pluginsystem.StopChain, nil
+        }
+        return q, nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Aborting via an exception: the hook raises an exception, the chain stops, and the error propagates upward through the dispatcher.
+
+## Middleware pattern: horizontal extensions
+
+The chain is the canonical mechanism for horizontal middleware (see [ADR-0005](../../spec/adr/0005-horizontal-hooks)). Governance, quota, and observability are plugged in as chain plugins with `priority >= 1000` and wrap every hook of every kind:
+
+```toml title="plugins/governance-middleware/dagstack.toml"
+[plugin]
+name = "governance"
+kind = "horizontal_middleware"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+priority = 1000    # horizontal range
+
+[plugin.chain_wrap]
+kinds = ["*"]
+hooks = ["*"]
+```
+
+The range `[1000, ∞)` is reserved for middleware. Business plugins keep `priority < 1000`.
+
+## Limitations
+
+- Chain hooks must be **RPC-safe** (compatible with `mcp_exposed = true`). Streams and complex cyclic objects are not supported; the contract test verifies this.
+- **The stage-N output schema must be compatible with the stage-N+1 input schema.** In our example, input and output match (`schemas/query.json`). When the schemas diverge, hookspec compilation in the emitters surfaces an error.
+
+## Common errors
+
+| Symptom | Cause |
+|---|---|
+| `DispatchMismatch: plugin returned type X, expected Y` | The plugin returned something the next stage was not expecting. Check the input/output schema compatibility. |
+| Changes from one plugin do not reach the next | The plugin returned **a copy without changes**, not the modified input. Check the logic — make sure the spread/`...query` is not lost. |
+| The plugin runs in an unexpected order | Check `priority` in the manifest; ties are sorted by name. |
+| The chain aborts unexpectedly | Some plugin returned the sentinel; check the dispatcher logs for `chain stopped by <plugin>`. |
+
+## When chain is the wrong fit
+
+- **All plugins must run in parallel** — use `broadcast-collect` or `broadcast-notify`.
+- **You need exactly one active plugin** — use `singleton`.
+- **Plugin selection depends on the input type, not on sequential processing** — use `capability`.
+
+## See also
+
+- [Dispatch](../../concepts/dispatch) — overview of all classes.
+- [ADR-0002 §4 chain](../../spec/adr/0002-hook-invocation) — the normative contract.
+- [ADR-0005: Horizontal extensions](../../spec/adr/0005-horizontal-hooks) — chain as the middleware mechanism.

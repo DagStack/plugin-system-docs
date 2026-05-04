@@ -1,0 +1,178 @@
+---
+sidebar_position: 1
+title: Схема dagstack.toml
+description: Полная таблица всех полей манифеста плагина — обязательных и опциональных, с типами, значениями по умолчанию, нормативной ссылкой.
+slug: /reference/manifest-schema
+---
+
+# Схема `dagstack.toml`
+
+Полная таблица полей манифеста плагина. Нормативный JSON Schema 2020-12 — в spec-репозитории [`_meta/manifest.schema.json`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta).
+
+Манифест может жить в одном из четырёх форматов:
+
+- `dagstack.toml` (Python и Go convention) — **основной формат**.
+- `dagstack.json` (TypeScript/Node convention).
+- Секция `[tool.dagstack.plugin]` в `pyproject.toml` (для Python-плагинов на PyPI).
+- Поле `dagstack` в `package.json` (для TypeScript-плагинов на npmjs.org).
+
+При наличии нескольких форматов приоритет: `dagstack.toml` → `dagstack.json` → встроенный в пакет.
+
+## Корневая секция `[plugin]`
+
+### Обязательные поля
+
+| Поле | Тип | Описание |
+|---|---|---|
+| `schema_version` | `string` | Версия JSON-схемы манифеста. На v1.0 = `"1"`. |
+| `name` | `string` | Имя плагина, уникальное в пределах `kind`. Строчные буквы, цифры, `-`, `_`. |
+| `kind` | `string` | Вид плагина — opaque string для ядра; приложение определяет список видов. |
+| `runtime` | `string` \| `string[]` | Исполняющая среда: `"in_process"` / `"mcp_stdio"` / `"mcp_http"`. Допустим массив. |
+| `core_version` | `string` | Semver range для версии `dagstack-plugin-system`. Пример: `"^0.2"`, `">=0.3.0 <1.0.0"`. |
+| `entry_point` | `string` | Модуль и класс: `"module:ClassName"`. **REQUIRED для in_process**. |
+
+### Метаинформация
+
+| Поле | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `version` | `string` | — | Semver собственная версия плагина. |
+| `description` | `string` | — | Краткое описание для человека. |
+| `authors` | `string[]` | `[]` | Список авторов. |
+| `homepage` | `string` | — | URL домашней страницы плагина. |
+| `license` | `string` | — | SPDX-идентификатор лицензии (например, `"Apache-2.0"`). |
+
+### Lifecycle и порядок (ADR-0002)
+
+| Поле | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `priority` | `int` (`0..100`) | `0` | Приоритет для dispatch и lifecycle-ordering. Больше = раньше/важнее. Range `[1000, ∞)` зарезервирован за horizontal-middleware (ADR-0005). |
+| `depends_on` | `string[]` \| `object[]` | `[]` | Список имён плагинов-зависимостей (или массив объектов `{kind, name}` для полной формы). |
+| `tryfirst` | `bool` | `false` | Escape-hatch для отладки: форсированно первым. Не замена `priority`/`depends_on` в production. |
+| `trylast` | `bool` | `false` | Форсированно последним. Несовместимо с `tryfirst=true`. |
+| `startup_timeout_sec` | `int` | `30` | Таймаут на `setup()` плагина. |
+| `teardown_timeout_sec` | `int` | `15` | Таймаут на `teardown()`. |
+
+### Dispatch (ADR-0002)
+
+| Поле | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `execution_model` | `string` | `"sync"` | `"async"` / `"sync"` / `"thread_cpu_bound"` / `"process_cpu_bound"`. |
+| `in_process_only` | `bool` | `false` | Если `true`, плагин живёт только в `in_process`-runtime (не может быть изолирован через MCP). |
+| `supports_languages` | `string[]` | `[]` | Для `capability`-dispatch: языки, которые плагин обрабатывает. |
+| `supports_extensions` | `string[]` | `[]` | Для `capability`-dispatch: расширения файлов. |
+| `supports_mime_types` | `string[]` | `[]` | Для `capability`-dispatch: MIME-типы. |
+| `fallback` | `bool` | `false` | Если `true`, плагин принимает все входы, не подошедшие другим. Ровно один на `kind`. |
+| `capabilities` | `string[]` | `[]` | Произвольные capability-идентификаторы (для governance-filtering и custom routing). |
+
+## Секция `[plugin.resources]`
+
+Декларация ресурсов, которые плагин ожидает получить через `PluginContext.resources`.
+
+| Поле | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `required` | `string[]` | `[]` | Обязательные ресурсы. При несоответствии плагин помечается `unavailable`. |
+| `optional` | `string[]` | `[]` | Опциональные. Доступ даёт `None` если не предоставлено. |
+
+Стандартные имена ресурсов — на странице [Стандартные ресурсы](./resources-list).
+
+## Секция `[plugin.unit_of_work]`
+
+Для долгоживущих плагинов, выполняющих UoW через orchestrator (ADR-0003 §5).
+
+| Поле | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `declared` | `bool` | `false` | `true` — плагин является UoW-плагином. |
+| `partition_key` | `string` | — | Ключ шардирования (`tenant_id`, `repo_id`, ...). |
+| `estimated_duration_sec` | `int` | — | Оценка длительности — подсказка планировщику. |
+| `idempotency_mode` | `string` | `"none"` | `"input_hash"` / `"output_hash"` / `"none"`. |
+| `checkpointable` | `bool` | `false` | Поддерживает ли плагин resume через `ctx.checkpoint`. |
+| `content_hash` | `string[]` | `[]` | Перечень полей для вычисления ключа идемпотентности. |
+
+## Секция `[plugin.mcp_stdio]` (для `runtime = "mcp_stdio"`)
+
+| Поле | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `command` | `string[]` | — | **REQUIRED**. Команда запуска подпроцесса (аргументы передаются массивом). |
+| `working_dir` | `string` | cwd процесса | Рабочая директория подпроцесса. |
+| `env` | `object` | `{}` | Переменные окружения для подпроцесса. |
+| `startup_timeout_sec` | `int` | `30` | Таймаут initial handshake. |
+
+## Секция `[plugin.mcp_http]` (для `runtime = "mcp_http"`)
+
+| Поле | Тип | По умолчанию | Описание |
+|---|---|---|---|
+| `url` | `string` | — | **REQUIRED**. Базовый URL MCP-сервиса. |
+| `auth_header` | `string` | — | Имя HTTP-заголовка для передачи bearer-токена. |
+| `auth_secret_env` | `string` | — | Имя env-переменной, содержащей secret (host подставит в заголовок). |
+| `timeout_sec` | `int` | `60` | Таймаут на один запрос. |
+| `tls_ca_bundle` | `string` | — | Путь к корпоративному CA-bundle для TLS (опционально). |
+
+## Секция `[plugin.metadata]`
+
+Произвольные ключи, не интерпретируемые ядром plugin-system. Могут использоваться приложением или горизонтальными middleware.
+
+```toml
+[plugin.metadata]
+owner_team = "search-platform"
+runbook = "https://runbook.example.org/chunker"
+on_call = "search-oncall@example.com"
+```
+
+## Полный пример
+
+```toml title="plugins/advanced-chunker/dagstack.toml"
+[plugin]
+schema_version = "1"
+name = "advanced-chunker"
+kind = "chunker"
+runtime = ["in_process", "mcp_stdio"]
+core_version = ">=0.1.0,<1.0.0"
+entry_point = "plugin:AdvancedChunker"
+version = "1.2.0"
+description = "Семантический чанкер на основе Tree-sitter с fallback на длину."
+authors = ["dagstack"]
+license = "Apache-2.0"
+
+priority = 50
+depends_on = ["tokenizer"]
+execution_model = "thread_cpu_bound"
+
+supports_languages = ["python", "typescript", "go"]
+supports_extensions = [".py", ".ts", ".go"]
+fallback = false
+
+[plugin.resources]
+required = ["clock"]
+optional = ["blob_store"]
+
+[plugin.unit_of_work]
+declared = true
+partition_key = "repo_id"
+idempotency_mode = "input_hash"
+checkpointable = true
+
+[plugin.mcp_stdio]
+command = ["python", "-m", "advanced_chunker.server"]
+startup_timeout_sec = 60
+
+[plugin.metadata]
+owner_team = "search-platform"
+runbook = "https://runbook.example.org/chunker"
+```
+
+## Валидация
+
+Ядро валидирует манифест при `discover()` против JSON-Schema 2020-12. Нарушения — `ManifestInvalid` с указанием поля и типа ошибки. Примеры типичных ошибок:
+
+- Отсутствует обязательное поле (`name`, `kind`, `runtime`, ...).
+- Неверный тип (`priority = "50"` вместо числа).
+- Неверное значение enum (`runtime = "in-process"` с дефисом вместо `"in_process"`).
+- Семвер-несовместимость (`core_version = "0.1"` вместо диапазона).
+
+## См. также
+
+- [Манифест плагина](../concepts/manifest) — концептуальный обзор.
+- [Виды плагинов](../concepts/kinds) — откуда берётся значение `kind`.
+- [Исполняющие среды](../concepts/runtimes) — настройка runtime-полей.
+- [Инварианты runtime](../concepts/invariants) — что требуется от плагинов за этой схемой.
+- [ADR-0001](../spec/adr/0001-core) — нормативный контракт базовой структуры манифеста.

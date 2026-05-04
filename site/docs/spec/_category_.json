@@ -1,0 +1,11 @@
+{
+  "label": "Specification",
+  "position": 5,
+  "collapsible": true,
+  "collapsed": true,
+  "link": {
+    "type": "generated-index",
+    "title": "Specification",
+    "description": "Normative architecture decisions for `dagstack/plugin-system` — how each piece interacts, which invariants are upheld, how contracts are emitted. Summaries are written in English; the formal normative ADR text lives in the spec repository, with links provided on each page."
+  }
+}

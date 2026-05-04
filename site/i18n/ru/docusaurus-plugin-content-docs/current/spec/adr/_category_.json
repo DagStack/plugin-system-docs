@@ -1,0 +1,11 @@
+{
+  "label": "ADR",
+  "position": 2,
+  "collapsible": true,
+  "collapsed": false,
+  "link": {
+    "type": "generated-index",
+    "title": "ADR (Architecture Decision Records)",
+    "description": "Шесть ADR, фиксирующих архитектурные решения `dagstack/plugin-system`. Каждая страница — русскоязычное резюме ключевых решений + пример на Python/TypeScript/Go + ссылка на полный нормативный ADR в spec-репо."
+  }
+}

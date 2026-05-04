@@ -1,0 +1,261 @@
+---
+sidebar_position: 4
+title: ADR-0004 · Hookspec formalism
+description: Hookspec as the source of truth for plugin-kind contracts — a YAML wrapper over JSON Schema, type generation for Python / TypeScript / Go / OpenRPC / Markdown, and a CI gate against drift.
+slug: /spec/adr/0004-hookspec
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0004 · Hookspec formalism
+
+**Status**: accepted v1.0 (2026-04-16) · [Full normative text](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0004-hookspec-formalism.md)
+
+## Why a formalism
+
+`dagstack/plugin-system` is a multi-language system. There are implementations in Python (pluggy + pydantic), TypeScript (zod), and Go (planned). Every implementation MUST share:
+
+- A single plugin manifest format.
+- A single set of plugin kinds (`tool`, `orchestrator`, future `vector_store`, `chunker`, `llm`, …).
+- The same hook signatures per kind (name, typed arguments, return type).
+- The same dispatch semantics (the five classes pinned in [ADR-0002](./0002-hook-invocation)).
+- A single MCP wire protocol (JSON-RPC 2.0 over stdio/HTTP) for cross-process plugins.
+
+**The problem**: where does this contract come from? If every binding writes its own hand-typed models, they diverge within a year — types drift, hook names disagree, semantics drift in the small details.
+
+ADR-0004 fixes the hookspec as the **single source of truth** for plugin-kind contracts and as the mechanism for generating types for every implementation from that source.
+
+## The decision — a hybrid of YAML + JSON Schema
+
+The source of truth is **two files per version of every plugin kind**:
+
+1. **Hookspec YAML** (`kinds/<kind>/v<N>.yaml`) — a thin wrapper that describes:
+   - The kind name and its version (`kind_api_version`).
+   - The list of hooks of that kind: name, dispatch class, description.
+   - References to JSON Schemas for the inputs and outputs of every hook.
+   - The flags `mcp_exposed` (participation in the MCP wire) and `mcp_tool_name_template` (template for the MCP-tool name).
+2. **JSON Schema 2020-12** (`kinds/<kind>/schemas/*.json`) — describes the structure of input and output payloads per the JSON Schema standard.
+
+The YAML wrapper is **≈200 lines of parser**. JSON Schema is a standard with ready-made validators and generators in every language.
+
+## A minimal hookspec example
+
+```yaml title="kinds/tool/v1.yaml"
+kind: tool
+kind_api_version: 1.0.0
+description: |
+  Function-style plugin: one or more executable hooks; each takes structured
+  arguments and returns a structured result.
+
+hooks:
+  - name: get_schema
+    dispatch: broadcast_collect
+    description: List of JSON schemas (one per plugin — schema of execute input).
+    input_schema: schemas/empty.json
+    output_schema: schemas/get_schema.output.json
+    mcp_exposed: false
+
+  - name: execute
+    dispatch: singleton
+    description: Run the tool with arguments.
+    input_schema: schemas/execute.input.json
+    output_schema: schemas/execute.output.json
+    mcp_exposed: true
+    mcp_tool_name_template: "{kind}.{plugin}.{hook}"
+```
+
+## Emitter pipeline
+
+A single hookspec file generates artefacts for every implementation:
+
+```
+spec/kinds/tool/v1.yaml + schemas/*.json
+        │
+        ├─► emitters/python_pydantic.py
+        │   → plugin-system-python/_generated/kinds/tool/v1.py
+        │   (pydantic models + Protocol class + dispatch decorators)
+        │
+        ├─► emitters/typescript_zod.ts
+        │   → plugin-system-typescript/src/_generated/kinds/tool/v1.ts
+        │   (zod schemas + interface + dispatcher metadata)
+        │
+        ├─► emitters/openrpc.py
+        │   → docs/openrpc/tool-v1.json
+        │   (read by MCP servers for tool registration)
+        │
+        └─► emitters/markdown.py
+            → docs/kinds/tool-v1.md
+            (human-readable kind documentation)
+```
+
+The emitters are **deterministic**: for the same hookspec the output is byte-equal across runs. Every implementation's CI runs the check:
+
+```bash
+make emit && git diff --exit-code
+```
+
+If a hookspec change did not trigger a regenerate, or a regenerate produced a different output, the CI is red. This makes **drift between source and the normative specification impossible** — in every commit the binding implementation matches the specification.
+
+## Where each artefact lives
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugin-system-python/src/dagstack/plugin_system/_generated/kinds/tool/v1.py"
+    # Automatically generated from kinds/tool/v1.yaml
+    # Do not edit by hand.
+    from typing import Protocol, runtime_checkable
+    from pydantic import BaseModel
+
+
+    class ExecuteInput(BaseModel):
+        name: str
+        args: dict[str, object]
+
+
+    class ExecuteOutput(BaseModel):
+        result: object
+        elapsed_ms: int
+
+
+    @runtime_checkable
+    class ToolPlugin(Protocol):
+        def get_schema(self) -> list[dict]:  # broadcast_collect
+            ...
+
+        def execute(self, input: ExecuteInput) -> ExecuteOutput:  # singleton
+            ...
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts title="plugin-system-typescript/src/_generated/kinds/tool/v1.ts"
+    // Automatically generated from kinds/tool/v1.yaml
+    // Do not edit by hand.
+    import { z } from "zod";
+
+    export const ExecuteInput = z.object({
+      name: z.string(),
+      args: z.record(z.any()),
+    });
+    export type ExecuteInput = z.infer<typeof ExecuteInput>;
+
+    export const ExecuteOutput = z.object({
+      result: z.any(),
+      elapsed_ms: z.number().int(),
+    });
+    export type ExecuteOutput = z.infer<typeof ExecuteOutput>;
+
+    export interface ToolPlugin {
+      getSchema(): Array<Record<string, unknown>>; // broadcast_collect
+      execute(input: ExecuteInput): Promise<ExecuteOutput>; // singleton
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugin-system-go/generated/kinds/tool/v1/tool.go"
+    // Automatically generated from kinds/tool/v1.yaml
+    // Do not edit by hand.
+    package tool
+
+    type ExecuteInput struct {
+        Name string         `json:"name"`
+        Args map[string]any `json:"args"`
+    }
+
+    type ExecuteOutput struct {
+        Result    any `json:"result"`
+        ElapsedMs int `json:"elapsed_ms"`
+    }
+
+    type ToolPlugin interface {
+        // broadcast_collect
+        GetSchema() ([]map[string]any, error)
+
+        // singleton
+        Execute(input ExecuteInput) (ExecuteOutput, error)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+In all three implementations:
+
+- Input and output types are identical (field names and their types).
+- Dispatch classes are noted in comments / decorators.
+- Each file is marked as auto-generated and not to be hand-edited.
+
+This guarantees that a plugin written against `ToolPlugin` in Python is compatible with a core that expects `ToolPlugin` in TypeScript — the `execute(input)` fields serialise identically.
+
+## Phase 0 — what is pinned now
+
+The hardest-to-reverse decisions are pinned in v1.0:
+
+1. **Closed enum of dispatch classes** — `singleton | broadcast_collect | broadcast_notify | chain | capability`. Extending the enum requires a new ADR.
+2. **`kind_api_version` semantics** — SemVer: a major bump is breaking; plugins MUST update the declaration in the manifest.
+3. **MCP tool naming convention** — `{kind}.{plugin}.{hook}`. Pinned in `_meta/`.
+4. **Hook naming convention** — `snake_case` in the YAML spec; implementations convert to language idioms (`camelCase` in TS).
+5. **Existing kinds (`tool`, `orchestrator`)** described as v1.0.0.
+6. **A working Python emitter** plus a TypeScript emitter with one hook as proof that the YAML is not Python-biased.
+
+Deferred to Phase 1+:
+
+- A Go emitter (lands together with the Go core).
+- Capability-dispatch primitives in YAML (currently declared in the plugin manifest, not in the hookspec).
+- CI tooling for backward-compatible schema diffs (currently — manual review).
+
+## Rejected alternatives
+
+| Alternative | Why rejected |
+|---|---|
+| **TypeSpec** (Microsoft IDL) | Go emitter is not first-class; community decorators for our Singleton / Broadcast / Chain do not exist. Worth revisiting in 1-2 years. |
+| **Pure OpenRPC** | Used as an **emit target**, not as the source of truth: it does not understand semantic primitives (Singleton / Broadcast); awkward to version per kind. |
+| **OpenAPI 3.1** | REST-centric; describing functions through `operations` is unnatural. |
+| **Protobuf + gRPC** | Its own wire format breaks MCP JSON compatibility; tooling-heavy. |
+| **JSON Schema without a wrapper** | Describes data, not functions; a hook → list-of-methods semantics would need a parallel file → we are back to a wrapper. |
+| **Custom IDL without a JSON Schema base** | Inventing a payload language from scratch; we lose ready-made validators, generators, and IDE tooling for JSON Schema. |
+
+## Lock-in — what is expensive to redo
+
+| Decision | Cost to back out |
+|---|---|
+| JSON Schema as the payload contract | **Cheap** — lingua franca, converts to almost anything. |
+| Custom YAML wrapper | **Cheap** — ~200 lines of parser; migration to TypeSpec is mechanical. |
+| OpenRPC as an emit target | **Free** — re-emit. |
+| Hook naming + kind_api versioning | **Expensive** — this is the binding contract with every existing plugin. Pinned in Phase 0. |
+| Adopting TypeSpec now | Expensive — tied to the Microsoft roadmap. |
+| Adopting Protobuf | Very expensive — the wire format changes and all clients break. |
+
+## Consequences
+
+**Positive:**
+
+- A single source of truth for contracts across 3+ languages; a change in the YAML is automatically propagated to every implementation.
+- Generated files are committed to the repo — users see them in diffs and do not depend on a build pipeline.
+- MCP autoport — OpenRPC automatically registers every `mcp_exposed: true` hook without a hand-maintained list.
+- Documentation is generated for free — markdown emit from the same YAML.
+- The migration path to another IDL (TypeSpec, once it matures) stays open through a mechanical YAML rewrite.
+
+**Trade-offs:**
+
+- A custom format requires maintaining a parser (~200 lines) and emitters (~150-300 lines each).
+- Generated files in the repo = more commit noise on changes. Mitigation: the `git diff --exit-code` CI gate guarantees sync plus an auto-PR for regeneration.
+- The cap of 5 fixed dispatch classes — adding a new class requires an ADR rather than a simple enum change.
+
+**What this ADR forbids**:
+
+- A binding MUST NOT add its own dispatch type that is absent from `_meta/dispatch_classes.yaml`.
+- A binding MUST NOT manually override a hook signature in `_generated/` — the `git diff --exit-code` CI gate catches this.
+- A hookspec MUST NOT describe payload outside JSON Schema 2020-12 (no custom primitives for types).
+
+## Related ADRs
+
+- [ADR-0001](./0001-core) — the plugin manifest uses types emitted from the hookspec.
+- [ADR-0002](./0002-hook-invocation) — dispatch classes are listed in the closed enum `_meta/dispatch_classes.yaml` referenced by the hookspec.
+- [ADR-0003](./0003-runtime-invariants) — `execution_model` in the hookspec describes the hook's execution style.
+- [ADR-0005](./0005-horizontal-hooks) — uses the same formalism to declare horizontal hooks.
+
+## Normative source
+
+The full text of ADR-0004, with architectural rationale, a comparison of alternatives, and a detailed implementation plan: [`plugin-system-spec/adr/0004-hookspec-formalism.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0004-hookspec-formalism.md).
+
+Sources for the emitters live in the [`_meta/`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta) directory of the spec repository.

@@ -1,0 +1,44 @@
+---
+sidebar_position: 1
+title: API Python — обзор
+description: Навигация по справочнику публичного API пакета dagstack-plugin-system; страницы генерируются pydoc-markdown из исходников.
+slug: /api/python
+---
+
+# API Python — обзор
+
+Справочник собирается автоматически из исходников пакета `dagstack-plugin-system` через [pydoc-markdown](https://niklasrosenstein.github.io/pydoc-markdown/) и обновляется при релизах.
+
+:::info Генерация на старте отложена
+В первой версии документационного сайта страницы справочника ещё не сгенерированы. Конфигурация pipeline лежит в `pydoc-markdown.yaml` в корне репозитория; запуск — `make api-python`. Содержимое пополнится в следующих коммитах.
+:::
+
+## Состав справочника (план)
+
+| Модуль | Что содержит |
+|---|---|
+| `dagstack.plugin_system` | Публичный верхний уровень — `discover`, `PluginRegistry`, `PluginManifest`, ошибки. |
+| `dagstack.plugin_system.contract` | Контрактные тесты — `run_contract_suite`, `assert_*` проверки, типы отчётов. |
+| `dagstack.plugin_system.dispatch` | Диспетчеры — `BroadcastCollectDispatcher`, `ChainDispatcher`, `CapabilityDispatcher`. |
+| `dagstack.plugin_system.resources` | Стандартные ресурсы и реальная/тестовая инъекция. |
+| `dagstack.plugin_system.adapters` | MCP-адаптеры для out-of-process плагинов. |
+| `dagstack.plugin_system.sinks` | `ProgressSink`, `CheckpointStore` reference-реализации. |
+
+## Как сгенерировать локально
+
+Требуется Python 3.11+ и установленный `pydoc-markdown`:
+
+```bash
+pip install pydoc-markdown
+cd <repo-root>
+make api-python
+```
+
+Сгенерированные `.mdx` попадут в `site/docs/api/python/`. Выполняется эта команда либо вручную перед коммитом, либо из CI-джобы, которая автоматически создаёт PR с обновлённой справкой после релиза Python-пакета.
+
+## Пока справочник не сгенерирован
+
+Используйте:
+- Строки документации (docstrings) прямо из пакета: `python -c "import dagstack.plugin_system as m; help(m)"`.
+- Страницы руководств: [Как написать плагин](/docs/guides/writing-a-plugin), [Конфигурация](/docs/guides/configuration), [Жизненный цикл](/docs/guides/lifecycle).
+- Спецификацию и ADR в [`dagstack/plugin-system-spec`](https://github.com/dagstack/plugin-system-spec) — нормативный источник контрактов.

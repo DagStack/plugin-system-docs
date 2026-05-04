@@ -1,0 +1,59 @@
+---
+sidebar_position: 2
+title: API TypeScript
+description: Автогенерируемая справка по публичному API TypeScript-реализации — появится после стабилизации и выхода полноценного runtime.
+slug: /api/typescript
+---
+
+# API TypeScript
+
+:::note В разработке
+Полноценная TypeScript-реализация (`@dagstack/plugin-system`) находится в дорожной карте. Сейчас пакет содержит:
+
+- Эмитируемые из спецификации **константы** (виды плагинов, коды ошибок, значения диспетчеров).
+- **Типы манифеста** (`PluginManifest`, `ResourcesSpec`, `UnitOfWorkSpec`).
+
+Runtime (`PluginRegistry`, `discover`, диспетчеры, контрактные тесты) появится в одном из ближайших релизов.
+:::
+
+## Что доступно сегодня
+
+Если вы собираете плагин на TypeScript, пока можно полагаться на:
+
+```ts
+import {
+  PluginManifest,
+  KIND_LLM,
+  KIND_VECTOR_STORE,
+  KIND_CHUNKER,
+  KIND_PIPELINE,
+  KIND_TOOL,
+  RUNTIME_IN_PROCESS,
+  RUNTIME_MCP_STDIO,
+  RUNTIME_MCP_HTTP,
+  DISPATCH_SINGLETON,
+  DISPATCH_BROADCAST_COLLECT,
+  DISPATCH_BROADCAST_NOTIFY,
+  DISPATCH_CHAIN,
+  DISPATCH_CAPABILITY,
+} from "@dagstack/plugin-system";
+```
+
+Эти константы синхронизированы с Python-реализацией через эмиттер спецификации — если Python использует `kind = "llm"`, то и TypeScript-константа `KIND_LLM === "llm"`.
+
+## Пока runtime недоступен
+
+До выхода полноценного runtime команды на TypeScript имеют два пути:
+
+1. **Обёртка над Python через MCP**. Запускать плагины на Python через `mcp_stdio`- или `mcp_http`-адаптер и вызывать их из TypeScript-приложения по стандартному MCP-протоколу.
+2. **Ждать релиза runtime** — следить за обновлениями в `@dagstack/plugin-system` на npmjs.org (пока опубликован в приватном реестре).
+
+## Что будет в справочнике, когда он появится
+
+- Публичные символы из `@dagstack/plugin-system` (runtime-ядро).
+- Протоколы / интерфейсы видов (`LLM`, `VectorStore`, `Chunker`, `Tool`, ...).
+- Контрактные тесты `runContractSuite` + все проверки.
+- Стандартные ресурсы `Clock`, `Rng`, `BlobStore`, `HttpClient` и их тестовые реализации.
+- MCP-адаптеры `MCPStdioAdapter`, `MCPHttpAdapter`.
+
+Генерация справочника — `typedoc` с выводом в markdown, коммит в `site/docs/api/typescript/`.

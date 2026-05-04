@@ -1,0 +1,196 @@
+---
+sidebar_position: 1
+title: ADR-0001 · Архитектура ядра
+description: Из чего состоит любая реализация dagstack/plugin-system — манифест, реестр, контекст, адаптеры, контрактные тесты. Как распространяются плагины. Как устроено версионирование.
+slug: /spec/adr/0001-core
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0001 · Архитектура ядра
+
+**Статус**: accepted v1.0 (2026-04-16) · [Полный нормативный текст](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0001-plugin-architecture-core.md)
+
+## Зачем спецификация единой архитектуры
+
+`dagstack/plugin-system` строится для приложений, где множество точек расширения — источники данных, модели, препроцессоры, шаги пайплайна, интеграции — меняются чаще, чем само ядро. Чтобы одни и те же плагины работали в Python-ядре и TypeScript-ядре одинаково, нужна общая карта: что входит в любую реализацию независимо от языка, а что — идиоматическая деталь реализации.
+
+ADR-0001 отвечает на этот вопрос: **шесть обязательных компонентов**, которые должен содержать любой распространяемый binding.
+
+## Шесть обязательных компонентов
+
+Любая реализация (`plugin-system-python`, `plugin-system-typescript`, планируемый `plugin-system-go`) состоит из следующих частей:
+
+1. **Схема манифеста** — JSON Schema 2020-12, источник правды хранится в [`plugin-system-spec/_meta/manifest.schema.json`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta). Все реализации генерируют свои типы из этой схемы — поля одинаковы, имена одинаковы, правила валидации одинаковы.
+2. **Диспетчер хуков** — отвечает за регистрацию плагинов, маршрутизацию вызовов, обработку жизненного цикла. Нормативная семантика — в [ADR-0002](./0002-hook-invocation).
+3. **Реестр плагинов (`PluginRegistry`)** — оболочка над диспетчером, которая добавляет обнаружение, валидацию манифеста, настройку жизненного цикла.
+4. **Контекст плагина (`PluginContext`)** — контейнер сквозных сервисов, который передаётся плагину на `setup`: конфиг, логгер, метрики, трассировщик, шина событий, реестр, опциональный тенантный контекст.
+5. **Адаптеры исполняющих сред** — минимум три: `in_process` (нативный для языка), `mcp_stdio` (подпроцесс через stdio), `mcp_http` (удалённый HTTP-сервис). Последние два — одинаковые во всех языках, потому что MCP — кросс-языковой протокол.
+6. **Рамка контрактных тестов** — набор обязательных сценариев (валидность манифеста, чистое завершение жизненного цикла, отсутствие утечек ресурсов), которые каждый плагин обязан проходить.
+
+## Три способа распространения плагинов
+
+Архитектура поддерживает три сценария размещения плагинов одновременно, без выбора «или-или»:
+
+- **A · In-tree** — папка `plugins/` в монорепо приложения-потребителя. Плагины живут рядом с бизнес-кодом, деплоятся с ним, версионируются в том же git-репо.
+- **B · Приватные пакеты** — отдельные модули в приватном реестре пакетов (Nexus PyPI, private npm-registry). Подходит, когда плагин переиспользуется несколькими приложениями внутри одной организации.
+- **C · Публичные пакеты** — публикация в PyPI / npmjs.org / Go module registry. Подходит для плагинов, рассчитанных на open-source сообщество.
+
+Один и тот же плагин может быть опубликован во всех трёх каналах одновременно. Приложение-потребитель выбирает, откуда его загрузить, на этапе сборки окружения.
+
+## Обязательный минимум манифеста
+
+Манифест декларируется в одном из стандартных файлов:
+
+- `dagstack.toml` (соглашение для Python и Go);
+- `dagstack.json` (соглашение для TypeScript/Node);
+- секция `[tool.dagstack.plugin]` в `pyproject.toml` (для Python-плагинов, публикуемых как pip-пакет);
+- поле `dagstack` в `package.json` (для TypeScript-плагинов).
+
+Минимальный набор обязательных полей:
+
+| Поле | Тип | Назначение |
+|---|---|---|
+| `schema_version` | string | Версия JSON-схемы манифеста (на v1.0 = `"1"`). |
+| `name` | string | Уникальное имя плагина в пределах вида. |
+| `kind` | string | Вид плагина — какой контракт он реализует. |
+| `runtime` | string \| array | Исполняющая среда: `in_process` / `mcp_stdio` / `mcp_http`. |
+| `core_version` | string | Требование к версии ядра (semver range). |
+
+Полная схема манифеста (нормативный JSON Schema 2020-12) — в spec-репозитории: [`_meta/manifest.schema.json`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta).
+
+## Проверка совместимости версий
+
+Плагин декларирует поддерживаемые версии ядра в поле `core_version` как semver-диапазон (`^0.2`, `>=0.3.0 <1.0.0`). При регистрации реестр проверяет, что установленная версия `dagstack-plugin-system` (или эквивалента в других языках) удовлетворяет диапазону. Несовместимые плагины отклоняются с ошибкой `VersionIncompatible` — с явным указанием, какая версия требуется и какая установлена.
+
+Это защищает от ситуации, когда плагин тихо перестаёт работать после обновления ядра: вместо странного поведения во время исполнения пользователь получает понятную ошибку на старте.
+
+## Опциональная изоляция процесса
+
+Адаптеры `mcp_stdio` и `mcp_http` позволяют запускать плагин как отдельный подпроцесс или удалённый сервис. Решение принимается **per-plugin**, не глобально:
+
+- in-tree плагин работает в основном процессе (`in_process`);
+- внешний плагин, которому нужна изоляция (например, «подозрительный» сторонний плагин, который нельзя пускать в основное адресное пространство), запускается как MCP-подпроцесс (`mcp_stdio`);
+- плагин на другом языке или развёрнутый отдельно — через `mcp_http`.
+
+Для приложения-потребителя все три варианта выглядят одинаково — оно работает с объектом-прокси плагина, не зная, в каком процессе он исполняется.
+
+## Пример минимального плагина
+
+Ниже — тот же echo-плагин на трёх языках. Все три манифеста эквивалентны; различия в коде — идиоматические особенности языков, а не расхождения в контракте.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```toml title="plugins/echo/dagstack.toml"
+    [plugin]
+    schema_version = "1"
+    name = "echo"
+    kind = "tool"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    ```
+
+    ```python title="plugins/echo/plugin.py"
+    from dagstack.plugin_system import PluginContext
+
+
+    class EchoPlugin:
+        async def setup(self, ctx: PluginContext) -> None:
+            self._ctx = ctx
+
+        def invoke(self, payload: str) -> str:
+            return payload
+
+        async def teardown(self) -> None:
+            pass
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```toml title="plugins/echo/dagstack.toml"
+    [plugin]
+    schema_version = "1"
+    name = "echo"
+    kind = "tool"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    ```
+
+    ```go title="plugins/echo/plugin.go"
+    package echo
+
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type EchoPlugin struct {
+        ctx *pluginsystem.PluginContext
+    }
+
+    // Unwrap satisfies pluginsystem.Plugin — the registry uses it to surface
+    // the underlying domain object to consumers. Returning nil is fine when
+    // the plugin instance itself is the addressable surface.
+    func (p *EchoPlugin) Unwrap() any { return nil }
+
+    // Setup is invoked once during Registry.SetupAll in topo-order.
+    func (p *EchoPlugin) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        p.ctx = pluginCtx
+        return nil
+    }
+
+    func (p *EchoPlugin) Invoke(payload string) (string, error) {
+        return payload, nil
+    }
+
+    func (p *EchoPlugin) Teardown(ctx context.Context) error { return nil }
+    ```
+  </TabItem>
+</Tabs>
+
+## Последствия
+
+**Положительные:**
+
+- Один плагин может быть написан один раз (как спецификация) и реализован одинаково на любом языке — без расхождений в поведении.
+- Приложение-потребитель выбирает язык ядра независимо от языков плагинов — сторонние плагины подключаются через MCP, даже если написаны на другом языке.
+- Контракт совместимости версий зафиксирован нормативно; бинарные несовместимости превращаются в понятные ошибки на старте.
+
+**Компромиссы:**
+
+- Любое изменение в схеме манифеста требует согласованного обновления всех реализаций — иначе расхождение в валидации ломает совместимость.
+- Добавление нового обязательного поля в манифест — breaking change для всех существующих плагинов, поэтому делается только через bump `schema_version` + migration path.
+
+**Что запрещено этим ADR**:
+
+- Добавлять в binding поля манифеста, которых нет в нормативной схеме (расширения допустимы только через `x-*` namespaced-поля или через отдельный ADR).
+- Менять порядок фаз жизненного цикла плагина (регистрация → инициализация → завершение) — ADR-0002 фиксирует его нормативно.
+
+## Связанные ADR
+
+- [ADR-0002](./0002-hook-invocation) — семантика вызова хуков, которая опирается на понятие реестра, введённое здесь.
+- [ADR-0003](./0003-runtime-invariants) — восемь runtime-инвариантов, которые гарантируют orchestration-neutrality.
+- [ADR-0004](./0004-hookspec) — формализм, по которому из спецификации вида плагина эмитируются типы для каждого языка.
+- [ADR-0006](./0006-discovery) — как именно реестр находит плагины в файловой системе.
+
+## Нормативный источник
+
+Полный текст ADR-0001 с формальными требованиями к каждой реализации: [`plugin-system-spec/adr/0001-plugin-architecture-core.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0001-plugin-architecture-core.md).

@@ -1,0 +1,327 @@
+---
+sidebar_position: 1
+title: Как написать плагин
+description: Пошаговое руководство по написанию плагина для dagstack/plugin-system — от создания папки до прохождения контрактных тестов.
+slug: /guides/writing-a-plugin
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Как написать плагин
+
+В этом руководстве вы напишете плагин-чанкер, который разбивает текстовый файл на фрагменты фиксированной длины. По ходу будут раскрыты: структура папки плагина, манифест, реализация, локальная проверка и контрактные тесты.
+
+## Структура папки
+
+Создайте папку и два файла в ней:
+
+```
+plugins/
+└── fixed-chunker/
+    ├── dagstack.toml
+    └── plugin.py
+```
+
+Имя папки должно совпадать с именем плагина в манифесте — это не обязательное техническое требование, но соглашение, принятое в экосистеме.
+
+## Манифест
+
+Объявите плагин как реализацию вида `chunker` для среды `in_process`. Объявите минимальный набор ресурсов: только часы (для меток времени в трассировке).
+
+```toml title="plugins/fixed-chunker/dagstack.toml"
+[plugin]
+name = "fixed"
+kind = "chunker"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+entry_point = "plugin:FixedChunker"
+version = "0.1.0"
+description = "Фиксированный чанкер — разбивает текст на куски равной длины."
+execution_model = "sync"     # стиль исполнения хуков: sync | async | thread_cpu_bound | process_cpu_bound
+
+[plugin.resources]
+required = ["clock"]
+```
+
+## Реализация
+
+Плагин реализует контракт вида `chunker`: метод `chunk(text: str, max_size: int) -> list[Chunk]`. В минимальной форме достаточно трёх методов жизненного цикла (`setup`, `teardown`) и основного `chunk`.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugins/fixed-chunker/plugin.py"
+    from dataclasses import dataclass
+    from dagstack.plugin_system import PluginContext
+
+
+    @dataclass
+    class Chunk:
+        text: str
+        offset: int
+
+
+    class FixedChunker:
+        """Splits the input text into fragments of exactly max_size characters."""
+
+        async def setup(self, context: PluginContext) -> None:
+            self._clock = context.resources.clock
+
+        def chunk(self, text: str, max_size: int = 512) -> list[Chunk]:
+            if max_size <= 0:
+                raise ValueError("max_size must be positive")
+            return [
+                Chunk(text=text[i : i + max_size], offset=i)
+                for i in range(0, len(text), max_size)
+            ]
+
+        async def teardown(self) -> None:
+            pass
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugins/fixed-chunker/plugin.go"
+    package fixed
+
+    import (
+        "context"
+        "errors"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type Chunk struct {
+        Text   string
+        Offset int
+    }
+
+    type FixedChunker struct {
+        resources pluginsystem.Resources
+    }
+
+    func (c *FixedChunker) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        c.resources = pluginCtx.Resources
+        return nil
+    }
+
+    func (c *FixedChunker) Chunk(text string, maxSize int) ([]Chunk, error) {
+        if maxSize <= 0 {
+            return nil, errors.New("maxSize must be positive")
+        }
+        chunks := make([]Chunk, 0, len(text)/maxSize+1)
+        for i := 0; i < len(text); i += maxSize {
+            end := i + maxSize
+            if end > len(text) {
+                end = len(text)
+            }
+            chunks = append(chunks, Chunk{Text: text[i:end], Offset: i})
+        }
+        return chunks, nil
+    }
+
+    func (c *FixedChunker) Teardown(ctx context.Context) error {
+        return nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Локальная проверка
+
+Убедитесь, что плагин виден реестру и проходит базовую smoke-проверку:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+    async def main() -> None:
+        registry = PluginRegistry()
+        registry.discover("plugins/")
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("smoke"),
+            registry=registry,
+        )
+        await registry.setup_all(ctx)
+        try:
+            chunker = registry.get_plugin("chunker", name="fixed")
+            pieces = chunker.chunk("Hello, dagstack!", max_size=5)
+            assert [p.text for p in pieces] == ["Hello", ", dag", "stack", "!"]
+        finally:
+            await registry.teardown_all()
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    package main
+
+    import (
+        "context"
+        "fmt"
+        "log/slog"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+        fixed "github.com/your-org/plugins/fixed-chunker"
+    )
+
+    func main() {
+        ctx := context.Background()
+
+        entries, err := pluginsystem.Discover("plugins/")
+        if err != nil {
+            panic(err)
+        }
+
+        reg := pluginsystem.NewRegistry()
+        for _, entry := range entries {
+            // The discoverer reads the manifest; the host binds an instance.
+            plugin := buildPlugin(entry.Manifest)
+            if err := reg.RegisterManifest(entry.Manifest, plugin); err != nil {
+                panic(err)
+            }
+        }
+
+        pluginCtx := &pluginsystem.PluginContext{
+            Logger:   slog.Default(),
+            Registry: reg,
+        }
+        if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+            panic(err)
+        }
+        defer reg.TeardownAll(ctx)
+
+        disp := pluginsystem.NewDispatchSingleton[*fixed.FixedChunker](reg, "chunker")
+        chunker, err := disp.Resolve()
+        if err != nil {
+            panic(err)
+        }
+        pieces, _ := chunker.Chunk("Hello, dagstack!", 5)
+        for _, p := range pieces {
+            fmt.Println(p.Text)
+        }
+        // pieces = ["Hello", ", dag", "stack", "!"]
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Контрактные тесты
+
+Контрактные тесты проверяют, что плагин соблюдает восемь runtime-инвариантов (см. [ADR-0003](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0003-orchestration-neutral-runtime.md)). Запускайте их в CI каждого плагина.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import (
+        load_manifest,
+        run_contract_suite,
+        ALL_CHECKS,
+    )
+    from plugins.fixed_chunker.plugin import FixedChunker
+
+
+    def test_contract():
+        manifest = load_manifest("plugins/fixed-chunker/dagstack.toml")
+        result = run_contract_suite(
+            plugin_class=FixedChunker,
+            manifest=manifest,
+            checks=ALL_CHECKS,
+        )
+        assert result.ok, result.format_failures()
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::info Contract suite is Python-only in Phase 1
+    The full contract suite (`run_contract_suite`, `assert_lifecycle_clean`, `assert_orchestration_neutral`, `assert_deterministic`, etc.) ships only in `dagstack-plugin-system` (Python) for the v0.1 line. The Go binding will gain a parallel suite in Phase 2; until then, validate Go plugins via standard `go test` against the same scenarios.
+    :::
+
+    ```go
+    package fixed_test
+
+    import (
+        "testing"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    func TestManifestValid(t *testing.T) {
+        manifest, err := pluginsystem.LoadManifestFromFile("plugins/fixed-chunker/dagstack.toml")
+        if err != nil {
+            t.Fatal(err)
+        }
+        if err := manifest.Validate(); err != nil {
+            t.Fatalf("manifest validation failed: %v", err)
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Проваленные проверки возвращают структурированный отчёт с указанием нарушенного инварианта. Наиболее частые замечания:
+
+- `AmbientStateViolation` — плагин читает/пишет глобальное состояние (переменные модуля, синглтоны вне реестра). Выносите состояние в `Resources`.
+- `SerializationError` — вход или выход плагина не сериализуется в JSON. Используйте только `dict`/`list`/`str`/`int`/`float`/`bool`/`None` на границе вызова.
+- `LeakDetected` — `teardown` не освобождает ресурсы, которые создал `setup` (файловые дескрипторы, сетевые соединения).
+- `DeterminismError` — плагин производит разный результат на одних и тех же входных данных без явного ресурса (`Clock`, `Rng`).
+
+## Что дальше
+
+- [Конфигурация плагинов](./configuration) — как плагин получает свои настройки из `dagstack/config`.
+- [Жизненный цикл](./lifecycle) — детали `setup`, `teardown`, зависимостей между плагинами.
+- [Реестр плагинов](../concepts/registry) — как плагины сочетаются в единый runtime.

@@ -1,0 +1,249 @@
+---
+sidebar_position: 4
+title: Виды (kinds) плагинов
+description: Что такое вид плагина, встроенные виды, как объявить свой собственный вид через hookspec.
+slug: /concepts/kinds
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Виды плагинов
+
+**Вид плагина** (`kind`) — это контракт, которому обязаны соответствовать все плагины данного вида. Вид задаёт:
+
+- набор хуков, которые плагин обязан реализовать;
+- типы входов и выходов каждого хука;
+- семантику диспетчеризации (один из пяти классов — см. [ADR-0002](../spec/adr/0002-hook-invocation));
+- требования к ресурсам (что приложение обязано инъектировать).
+
+Когда вы пишете плагин и объявляете `kind = "chunker"` в манифесте, ядро проверяет, что ваш плагин реализует контракт `chunker`-вида, и регистрирует его. Другие компоненты приложения запрашивают плагины по виду, не зная конкретных имён реализаций.
+
+## Встроенные виды
+
+В текущей v1.0-реализации нормативно зафиксированы два вида в spec-репозитории; остальные виды объявляются приложением-потребителем:
+
+| Вид | Hookspec | Назначение |
+|---|---|---|
+| `tool` | [`kinds/tool/v1.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/kinds/tool) | Функция-как-плагин: принимает структурированный аргумент, возвращает структурированный результат. |
+| `orchestrator` | [`kinds/orchestrator/v1.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/kinds/orchestrator) | Управление жизненным циклом долгоживущих операций — `enqueue`, `status`, `backfill`. |
+
+Во многих приложениях используются **доменные виды**, объявляемые самим приложением-потребителем. Несколько типичных классов:
+
+**Data-обработка:**
+
+- `source` — источник данных (S3-bucket, Postgres-таблица, Kafka-топик).
+- `processor` — трансформация/обогащение записей.
+- `sink` — целевое хранилище (Elasticsearch, warehouse, файл).
+
+**Уведомления и интеграции:**
+
+- `notifier` — отправка уведомлений (email / SMS / webhook / push).
+- `auth_provider` — OAuth / SAML / LDAP интеграция.
+- `webhook_handler` — обработчик входящих webhooks.
+
+**Бизнес-логика:**
+
+- `payment_provider` — Stripe / PayPal / внутренний платёжный модуль.
+- `tax_calculator` — расчёт налогов per юрисдикция.
+- `pricing_strategy` — ценовая стратегия.
+
+**AI / RAG (один из возможных сценариев):**
+
+- `llm` — языковая модель.
+- `embedder` — текст → вектор.
+- `vector_store` — векторное хранилище.
+- `chunker` — разбиение текста на фрагменты.
+- `reranker` — повторное ранжирование.
+
+**Observability / platform:**
+
+- `metric_exporter` — выгрузка метрик в Prometheus / OTLP.
+- `audit_logger` — запись событий в audit-trail.
+- `rate_limiter` — лимитирование запросов.
+
+Эти виды не встроены в plugin-system ядро — приложение регистрирует их hookspecs при старте. Один и тот же dagstack-инсталл применим ко всем этим классам: plugin-system не знает про домен, только про контракты.
+
+## Kind — opaque string для ядра
+
+Plugin-system **не валидирует** значение поля `kind` в манифесте. Для ядра это непрозрачный идентификатор. Ответственность за список разрешённых видов — на приложении-потребителе:
+
+1. Приложение регистрирует hookspecs видов, которые ожидает, на старте.
+2. При discovery манифест плагина с неизвестным `kind` отклоняется с ошибкой `KindUnknown`.
+3. Приложение читает плагины определённого вида через `registry.get_plugin("kind", name="...")` или через диспетчер.
+
+Это делает `kind` расширяемой концепцией — приложение определяет свой набор видов без изменений в ядре plugin-system.
+
+## Объявление собственного вида
+
+Приложению часто нужны собственные виды плагинов — например, `notifier` с конкретной сигнатурой `send(recipient, message, metadata)`, `payment_provider` с `charge(amount, customer_id, idempotency_key)`, или `llm` с `complete(prompt, temperature, max_tokens)`. Объявление собственного вида выполняется в два шага:
+
+### 1. Написать hookspec в YAML
+
+Hookspec описывает все хуки вида, их сигнатуры (через JSON Schema) и классы диспетчеризации.
+
+```yaml title="kinds/llm/v1.yaml"
+kind: llm
+kind_api_version: 1.0.0
+description: |
+  Языковая модель — завершает текст по промпту; опционально поддерживает
+  чат-интерфейс и streaming.
+
+hooks:
+  - name: complete
+    dispatch: singleton
+    description: Сгенерировать завершение для промпта.
+    input_schema: schemas/complete.input.json
+    output_schema: schemas/complete.output.json
+    mcp_exposed: true
+
+  - name: chat
+    dispatch: singleton
+    description: Чат-запрос с историей сообщений.
+    input_schema: schemas/chat.input.json
+    output_schema: schemas/chat.output.json
+    mcp_exposed: true
+```
+
+Структура hookspec детально описана в [ADR-0004](../spec/adr/0004-hookspec).
+
+### 2. Сгенерировать типы для своего языка
+
+Из hookspec эмитируются типы для каждой реализации (pydantic для Python, zod для TypeScript, struct+interface для Go). Приложение коммитит сгенерированный код в свой репозиторий и использует как обычные типы.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # Generated from kinds/llm/v1.yaml
+    from typing import Protocol
+    from pydantic import BaseModel
+
+
+    class CompleteInput(BaseModel):
+        prompt: str
+        temperature: float = 0.7
+        max_tokens: int | None = None
+
+
+    class CompleteOutput(BaseModel):
+        text: str
+        tokens_used: int
+
+
+    class LLMPlugin(Protocol):
+        def complete(self, input: CompleteInput) -> CompleteOutput: ...
+        def chat(self, input: ChatInput) -> ChatOutput: ...
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // Generated from kinds/llm/v1.yaml
+    package llm
+
+    type CompleteInput struct {
+        Prompt      string   `json:"prompt"`
+        Temperature float64  `json:"temperature"`
+        MaxTokens   *int     `json:"max_tokens,omitempty"`
+    }
+
+    type LLMPlugin interface {
+        Complete(input CompleteInput) (CompleteOutput, error)
+        Chat(input ChatInput) (ChatOutput, error)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### 3. Зарегистрировать hookspec в приложении
+
+При старте приложение регистрирует hookspec, чтобы ядро могло валидировать манифесты плагинов этого вида:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+    from my_app.kinds import LlmHookSpec, EmbedderHookSpec, VectorStoreHookSpec
+
+
+    async def main() -> None:
+        registry = PluginRegistry()
+        # Register the hookspecs of our kinds first.
+        registry.add_hookspecs(LlmHookSpec)
+        registry.add_hookspecs(EmbedderHookSpec)
+        registry.add_hookspecs(VectorStoreHookSpec)
+
+        registry.discover("plugins/")
+
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("app"),
+            registry=registry,
+        )
+        await registry.setup_all(ctx)
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::warning Custom-kind hookspec registration is host-side
+    `go.dagstack.dev/plugin-system v0.1.0-rc.1` does not bake hookspec loading into `Discover()` — Phase 1 deliberately keeps the registry kind-agnostic. The pattern is: emit `LLMPlugin` / `EmbedderPlugin` / `VectorStorePlugin` Go interfaces from `kinds/*/v1.yaml` into your application package, then enforce them at registration via type assertion (`plugin.Unwrap().(LLMPlugin)`) before calling `RegisterManifest()`. A first-class `WithKindHookspecs()` discovery option is on the Phase 2 roadmap.
+    :::
+  </TabItem>
+</Tabs>
+
+## Версионирование видов
+
+Hookspec вида версионируется через поле `kind_api_version` (semver). Плагин объявляет в манифесте, какую версию вида он реализует; при несовместимости — `VersionIncompatible`.
+
+- **Minor bump** (`1.0.0` → `1.1.0`) — добавлен новый опциональный хук, старые плагины продолжают работать.
+- **Major bump** (`1.0.0` → `2.0.0`) — breaking change в сигнатуре существующего хука. Плагины обязаны обновиться.
+
+## Антипаттерны
+
+- **«Мега-вид» на все случаи**. Вид с хуками на 10 разных операций (`chunk`, `embed`, `search`, `rerank`) стирает границы между ответственностями. Разбивайте на специализированные виды.
+- **Вид ради одного плагина**. Если вид имеет одну реализацию без планов на альтернативы — возможно, это прямой вызов функции, а не плагин. Плагин — это когда есть хотя бы две реализации (реальные или потенциальные).
+- **Произвольные kind-имена без конвенций**. В экосистеме приложения — договоритесь о naming convention: всё строчными, `snake_case`, существительные, без версий в имени. `llm`, не `LLM` / `LanguageModel` / `llm_v2`.
+
+## См. также
+
+- [Манифест плагина](./manifest) — поле `kind` и `kind_api_version`.
+- [Обнаружение](./discovery) — как `discover()` валидирует `kind`.
+- [ADR-0004: Формализм hookspec](../spec/adr/0004-hookspec) — формат YAML-спеков видов.
+- [Руководство: Написать плагин](../guides/writing-a-plugin) — практический пример.

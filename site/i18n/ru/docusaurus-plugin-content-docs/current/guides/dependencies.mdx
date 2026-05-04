@@ -1,0 +1,240 @@
+---
+sidebar_position: 5
+title: Зависимости между плагинами
+description: depends_on в манифесте, топологическая сортировка при setup, циклы, partial failure при падении зависимости.
+slug: /guides/dependencies
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Зависимости между плагинами
+
+Плагин может объявить, что его инициализация зависит от других плагинов — например, `order_processor` требует, чтобы `payment_provider` был уже готов. Реестр учитывает декларации в топологической сортировке и инициализирует плагины в правильном порядке.
+
+## Декларация в манифесте
+
+Секция `depends_on` в манифесте — список плагинов, от которых зависит текущий. Запись — это либо строка (только `name`, `kind` подразумевается), либо таблица с явным `kind` и `name`.
+
+```toml title="plugins/order_processor/default/dagstack.toml"
+[plugin]
+name = "default"
+kind = "order_processor"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+
+# Простая форма — имя плагина-зависимости.
+depends_on = ["stripe"]
+
+# Или полная форма — если имя неуникально в разных видах.
+[[plugin.depends_on]]
+kind = "payment_provider"
+name = "stripe"
+```
+
+## Порядок инициализации
+
+При вызове `registry.setup_all()`:
+
+1. Реестр строит граф зависимостей из `depends_on` всех зарегистрированных плагинов.
+2. Топологическая сортировка `topo_sort` определяет порядок: если `B` зависит от `A`, то `setup(A)` вызывается раньше `setup(B)`.
+3. Плагины одного уровня (без взаимных зависимостей) инициализируются параллельно, с per-plugin таймаутом `startup_timeout_sec` (по умолчанию 30 секунд).
+
+Результат: к моменту вызова `setup(order_processor)` плагин `payment_provider` уже инициализирован и доступен через `context.registry`.
+
+## Использование зависимости в setup
+
+В `setup()` получите зависимый плагин через `context.registry`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugins/order_processor/default/plugin.py"
+    from dagstack.plugin_system import PluginContext
+
+
+    class DefaultOrderProcessor:
+        async def setup(self, context: PluginContext) -> None:
+            # payment_provider is guaranteed to be initialised by now.
+            self._payment = context.registry.get_plugin(
+                "payment_provider",
+                name="stripe",
+            )
+
+        async def process(self, order):
+            total = sum(item.price * item.quantity for item in order.items)
+            result = await self._payment.charge(
+                amount_cents=int(total * 100),
+                currency=order.currency,
+                source=order.payment_token,
+            )
+            return {"order_id": order.id, "transaction_id": result.transaction_id}
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugins/order_processor/default/plugin.go"
+    package defaultproc
+
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type DefaultOrderProcessor struct {
+        payment PaymentProvider
+    }
+
+    func (p *DefaultOrderProcessor) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        // The kind has a singleton dispatcher; resolve it via a typed dispatcher.
+        disp := pluginsystem.NewDispatchSingleton[PaymentProvider](pluginCtx.Registry, "payment_provider")
+        provider, err := disp.Resolve()
+        if err != nil {
+            return err
+        }
+        p.payment = provider
+        return nil
+    }
+
+    func (p *DefaultOrderProcessor) Process(ctx context.Context, order Order) (ProcessResult, error) {
+        total := computeTotal(order)
+        result, err := p.payment.Charge(ctx, ChargeInput{
+            AmountCents: int(total * 100),
+            Currency:    order.Currency,
+            Source:      order.PaymentToken,
+        })
+        if err != nil {
+            return ProcessResult{}, err
+        }
+        return ProcessResult{OrderID: order.ID, TransactionID: result.TransactionID}, nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Циклы зависимостей
+
+Если `A → B → A` (прямой или транзитивный цикл) — `setup_all()` бросает `DependencyCycle` с указанием всей цепочки. Ядро не стартует.
+
+Типичный сценарий цикла: два плагина хотят обращаться друг к другу («A вызывает B, B вызывает A»). Разорвите через:
+
+- **Общий младший плагин**: вынести общую логику в третий плагин `X`, оба зависят от `X`.
+- **Deferred lookup**: не делать `registry.get()` в `setup`, а откладывать до первого вызова хука (lazy) — тогда граф зависимостей пуст.
+
+## Partial failure при падении зависимости
+
+Если `setup(payment_provider)` падает (исключение или таймаут), `setup_all(ctx)` пробрасывает ошибку, и весь старт прерывается. Реестр в `0.1.0-rc.2` сохраняет fail-fast-семантику — плагины не запускаются частично.
+
+:::info Phase 2 scope
+Режим «continue-on-failure» (`unavailable_plugins()`, рекурсивная маркировка зависимых, старт в деградировавшем режиме) — в дорожной карте Phase 2. До этого момента приложение анализирует исключение из `setup_all(ctx)` и решает, продолжать ли запуск.
+:::
+
+## Приоритет vs зависимости
+
+`priority` и `depends_on` — **две разных оси**:
+
+- `depends_on` — жёсткая зависимость: B не может инициализироваться до A.
+- `priority` — порядок внутри одной топологической группы (плагины без взаимных зависимостей) + tiebreak для singleton/capability-dispatch.
+
+В большинстве случаев используйте `depends_on`, когда есть реальная зависимость в `setup`. `priority` — только для управления порядком вызовов в broadcast/chain-dispatch.
+
+## Как проверить граф зависимостей локально
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import PluginRegistry
+
+    registry = PluginRegistry()
+    registry.discover("plugins/")
+    for manifest in registry.list_manifests():
+        deps = ", ".join(manifest.depends_on) or "(none)"
+        print(f"{manifest.name:30s} depends on: {deps}")
+    ```
+
+    ```
+    stripe                         depends on: (none)
+    tax_calculator                 depends on: (none)
+    order_processor                depends on: stripe
+    invoice_generator              depends on: order_processor, tax_calculator
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "fmt"
+        "strings"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        return err
+    }
+    for _, entry := range entries {
+        names := make([]string, 0, len(entry.Manifest.DependsOn))
+        for _, dep := range entry.Manifest.DependsOn {
+            names = append(names, dep.Name)
+        }
+        deps := strings.Join(names, ", ")
+        if deps == "" {
+            deps = "(none)"
+        }
+        fmt.Printf("%-30s depends on: %s\n", entry.Manifest.Name, deps)
+    }
+    ```
+
+    :::info Topological order is computed inside `SetupAll`
+    The Go binding does not export a standalone `TopoSort` helper; the registry computes the topological order during `SetupAll`. To inspect dependencies before setup, walk `Manifest.DependsOn` directly as shown above.
+    :::
+  </TabItem>
+</Tabs>
+
+## Отладка
+
+| Симптом | Возможная причина |
+|---|---|
+| `DependencyCycle: A → B → A` на старте | Прямой или транзитивный цикл в `depends_on`. |
+| `Plugin X unavailable: dependency Y failed` | `Y` упал в `setup()` или превысил `startup_timeout_sec`. Смотреть логи `Y`. |
+| `KindUnknown: payment_provider` в `setup()` order_processor | В `depends_on` указан `payment_provider`, но такого плагина в реестре нет. |
+| `AmbiguousPlugin: embedder` | В реестре два плагина вида `embedder` и неоднозначность выбора. Указать `name=` в `registry.get()` явно. |
+
+## См. также
+
+- [Жизненный цикл плагина](./lifecycle) — фазы `setup`/`teardown` в деталях.
+- [ADR-0002: Семантика вызова хуков](../spec/adr/0002-hook-invocation) — формальный алгоритм topo-sort.
+- [Реестр плагинов](../concepts/registry) — обработка ошибок, partial failure.

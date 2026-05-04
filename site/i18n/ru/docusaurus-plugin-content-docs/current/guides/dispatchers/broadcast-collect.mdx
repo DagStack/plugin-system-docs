@@ -1,0 +1,238 @@
+---
+sidebar_position: 2
+title: Broadcast-collect
+description: End-to-end walkthrough для класса broadcast-collect — все плагины вида вызываются, результаты агрегируются, fail-fast vs best-effort.
+slug: /guides/dispatchers/broadcast-collect
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Broadcast-collect — собрать результаты от всех
+
+`broadcast-collect` — все зарегистрированные плагины вида вызываются, результаты собираются в массив. Типичное применение — каталоги инструментов, экспортёры метрик, capability-providers.
+
+## Сценарий: каталог инструментов для LLM-агента
+
+LLM-агент спрашивает: «какие инструменты мне доступны?» — ответ собирается от всех подключённых плагинов вида `tool_provider`.
+
+### Шаг 1. Hookspec вида
+
+```yaml title="kinds/tool_provider/v1.yaml"
+kind: tool_provider
+kind_api_version: 1.0.0
+description: Источник инструментов для LLM-агента.
+
+hooks:
+  - name: list_tools
+    dispatch: broadcast_collect
+    description: Список инструментов, которые этот источник предоставляет.
+    input_schema: schemas/empty.json
+    output_schema: schemas/tool_list.json
+    mcp_exposed: true
+    # Опциональная error-policy для broadcast-collect:
+    error_policy: fail_fast    # по умолчанию
+```
+
+### Шаг 2. Несколько плагинов вида
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```toml title="plugins/tool_provider/filesystem/dagstack.toml"
+    [plugin]
+    name = "filesystem"
+    kind = "tool_provider"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 50
+    ```
+
+    ```python title="plugins/tool_provider/filesystem/plugin.py"
+    class FilesystemToolProvider:
+        async def setup(self, ctx):
+            pass
+
+        def list_tools(self):
+            return [
+                {"name": "read_file", "description": "Read a file"},
+                {"name": "write_file", "description": "Write a file"},
+                {"name": "list_dir", "description": "List directory contents"},
+            ]
+    ```
+
+    ```toml title="plugins/tool_provider/web/dagstack.toml"
+    [plugin]
+    name = "web"
+    kind = "tool_provider"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 40
+    ```
+
+    ```python title="plugins/tool_provider/web/plugin.py"
+    class WebToolProvider:
+        async def setup(self, ctx):
+            pass
+
+        def list_tools(self):
+            return [
+                {"name": "http_get", "description": "Fetch a page"},
+                {"name": "search", "description": "Search the web"},
+            ]
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```json title="plugins/tool_provider/filesystem/dagstack.json"
+    {
+      "plugin": {
+        "name": "filesystem",
+        "kind": "tool_provider",
+        "runtime": "in_process",
+        "core_version": "^0.2",
+        "priority": 50
+      }
+    }
+    ```
+
+    ```ts title="plugins/tool_provider/filesystem/plugin.ts"
+    export class FilesystemToolProvider {
+      listTools(): Tool[] {
+        return [
+          { name: "read_file", description: "Read a file" },
+          { name: "write_file", description: "Write a file" },
+        ];
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```toml title="plugins/tool_provider/filesystem/dagstack.toml"
+    [plugin]
+    name = "filesystem"
+    kind = "tool_provider"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 50
+    ```
+
+    ```go title="plugins/tool_provider/filesystem/plugin.go"
+    package fs
+
+    import "context"
+
+    type FilesystemToolProvider struct{}
+
+    func (p *FilesystemToolProvider) ListTools(ctx context.Context) ([]Tool, error) {
+        return []Tool{
+            {Name: "read_file", Description: "Read a file"},
+            {Name: "write_file", Description: "Write a file"},
+        }, nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+### Шаг 3. Собрать инструменты от всех
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import BroadcastCollectDispatcher
+
+    dispatcher = BroadcastCollectDispatcher(registry)
+    tools_lists, errors = dispatcher.dispatch(
+        "tool_provider", "list_tools", ctx,
+    )
+    # tools_lists = [
+    #   [{"name": "read_file", ...}, {"name": "write_file", ...}, ...],  # from filesystem (priority=50)
+    #   [{"name": "http_get", ...}, {"name": "search", ...}],             # from web (priority=40)
+    # ]
+    # errors = []  # under fail_fast a non-empty list means the call already raised BroadcastErrors
+
+    # Flatten into a single list:
+    all_tools = [tool for tools in tools_lists for tool in tools]
+    agent.configure(tools=all_tools)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "context"
+        "log/slog"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    collect := pluginsystem.NewDispatchBroadcastCollect(reg, "tool_provider")
+    results := collect.Dispatch(ctx, func(ctx context.Context, p pluginsystem.Plugin) (any, error) {
+        return p.Unwrap().(ToolProvider).ListTools(ctx)
+    })
+
+    var allTools []Tool
+    for _, r := range results {
+        if r.Err != nil {
+            slog.Warn("tool_provider failed", "name", r.PluginName, "err", r.Err)
+            continue
+        }
+        allTools = append(allTools, r.Value.([]Tool)...)
+    }
+    ```
+
+    `Dispatch` returns `[]CollectResult`; each entry holds `PluginName`, `Value` and `Err`. The dispatcher walks every plugin registered under the kind in `priority desc` order and collects results without aborting on a single failure — fail-fast behaviour, when needed, is implemented by the caller (return early on the first non-nil `Err`).
+  </TabItem>
+</Tabs>
+
+## Порядок результатов
+
+Результаты собираются в порядке `priority desc`, при равных — по имени плагина. В нашем примере сначала идут инструменты от `filesystem` (priority=50), потом от `web` (priority=40).
+
+Если порядок важен (например, поиск предпочитаемых инструментов идёт первым в LLM-контексте), фиксируйте его через приоритет.
+
+## Error-policy: fail-fast vs best-effort
+
+**Fail-fast** (по умолчанию): падение одного плагина ломает весь collect, приложение получает исключение, упавший плагин помечается `degraded`.
+
+**Best-effort**: падение одного плагина логируется и пропускается, collect возвращает частичный результат. Включается в hookspec:
+
+```yaml
+hooks:
+  - name: list_tools
+    dispatch: broadcast_collect
+    error_policy: best_effort
+```
+
+Выбор:
+
+- **Fail-fast** — когда целостность набора критична. Каталог инструментов частично загружен = риск, что LLM не увидит нужный инструмент и сделает ошибочный план.
+- **Best-effort** — когда важнее доступность чем полнота. Metric-экспортёры: если один упал, остальные должны отправлять метрики дальше.
+
+## Типичные ошибки
+
+| Симптом | Причина |
+|---|---|
+| `BroadcastErrors: plugin=web error=...` | Один плагин упал, fail-fast-режим. Проверить логи упавшего; или перейти на best-effort в hookspec. |
+| Результаты приходят в неожиданном порядке | Проверить `priority` в манифестах; при равных — сортировка по имени. |
+| Пустой массив от одного плагина | Плагин возвращает `[]` — это валидный результат (пустой каталог), не ошибка. |
+
+## См. также
+
+- [Диспетчеризация](../../concepts/dispatch) — обзор всех классов.
+- [ADR-0002 §2 broadcast-collect](../../spec/adr/0002-hook-invocation) — нормативный контракт + error-policy.
+- [Broadcast-notify](./broadcast-notify) — fire-and-forget, без сборки результатов.

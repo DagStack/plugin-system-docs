@@ -1,0 +1,11 @@
+{
+  "label": "Понятия",
+  "position": 2,
+  "collapsible": true,
+  "collapsed": false,
+  "link": {
+    "type": "generated-index",
+    "title": "Понятия",
+    "description": "Ключевые объекты предметной области — реестр, манифест, обнаружение, диспетчеризация."
+  }
+}

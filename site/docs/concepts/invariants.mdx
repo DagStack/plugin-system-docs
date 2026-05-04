@@ -1,0 +1,312 @@
+---
+sidebar_position: 8
+title: Runtime invariants
+description: Eight behavioural invariants every plugin must observe — the rules that keep a plugin operable across orchestration environments without conditional code.
+slug: /concepts/invariants
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Runtime invariants
+
+The plugin-system guarantees that the same plugin behaves identically:
+
+- in an in-process application (FastAPI, Django, an ordinary Python/Node/Go service);
+- inside an orchestrator op (Dagster asset, Airflow task);
+- in a task-queue worker (Celery, RQ);
+- in a unit test (with mocked resources).
+
+That property is not accidental. It only holds when the plugin observes **eight runtime invariants** fixed in [ADR-0003](../spec/adr/0003-runtime-invariants). If even one is violated, the plugin stops working when it crosses from one environment to another.
+
+This page is an overview of how each invariant is applied in practice. The normative contract lives in ADR-0003.
+
+## Summary table
+
+| # | Invariant | How it is checked |
+|---|---|---|
+| 1 | Orchestration neutrality (no reliance on ambient host state) | Automated test across three hosts. |
+| 2 | Serialisable boundaries | Round-trip JSON serialisation for every input and output. |
+| 3 | Resources via DI | Verifying that the plugin does not construct HTTP/DB clients itself. |
+| 4 | Explicit `execution_model` | Manifest declaration; runtime detector for blocking I/O in sync plugins. |
+| 5 | Unit of Work for long-running plugins | Manifest declaration. |
+| 6 | Abstract ProgressSink / CheckpointStore | Absence of direct WebSocket / file I/O imports. |
+| 7 | Idempotency modes (`input_hash` / `output_hash` / `none`) | Manifest declaration plus a re-run with the same input. |
+| 8 | Determinism for `output_hash` | Two runs with a frozen clock and seeded RNG, bit-equal comparison. |
+
+## 1. Orchestration neutrality
+
+**Rule**: a plugin must not rely on ambient host state — the current event loop, process-level singletons, locale, or working directory.
+
+**What is forbidden**:
+
+- Relying on `asyncio.get_event_loop()` / `Tokio::current()` / equivalents in the constructor or `setup()`.
+- Reading or writing process-level singletons (thread-locals, module-mutable state, a "global client").
+- Using the file system outside `ctx.resources.tmpdir`.
+- Reading `os.environ` during the runtime phase (reading it in `setup()` and caching the result is fine).
+- Relying on `os.getcwd()`.
+
+**How to fix violations**:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # ✗ Bad — capturing an external event loop.
+    class BadPlugin:
+        def __init__(self):
+            self.loop = asyncio.get_event_loop()  # breaks inside an orchestrator
+
+    # ✓ Good — never hold a reference to the loop.
+    class GoodPlugin:
+        def __init__(self):
+            pass  # lazy-init; everything happens in setup()
+
+        async def setup(self, ctx):
+            # asyncio.get_running_loop() inside an async function returns the current run's loop — fine.
+            pass
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    // ✗ Bad — module-scoped state captured at import time.
+    let cachedPool: DBClient | null = null;
+
+    // ✓ Good — through Resources DI.
+    export class GoodPlugin {
+      private db!: DBClient;
+
+      async setup(ctx: PluginContext): Promise<void> {
+        this.db = ctx.resources.get<DBClient>("postgres");
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    // ✗ Bad — global state.
+    var cachedPool *sql.DB
+
+    // ✓ Good — through Resources DI.
+    type GoodPlugin struct {
+        db DBClient // user-defined interface
+    }
+
+    func (p *GoodPlugin) Unwrap() any { return p }
+
+    func (p *GoodPlugin) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        raw, err := pluginCtx.Resources.Get("postgres")
+        if err != nil {
+            return err
+        }
+        p.db = raw.(DBClient)
+        return nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## 2. Serialisable boundaries
+
+**Rule**: anything that crosses the plugin boundary (hook input, hook output, checkpoint, progress event) must be JSON-serialisable.
+
+**What may not be passed**:
+
+- Live HTTP/DB clients, session objects, connection pools.
+- Open file descriptors.
+- Async generators, coroutines, threads, channels.
+- Closures and bound methods.
+- C-extension native handles.
+
+**What is allowed**:
+
+- Structured data describable by JSON Schema.
+- Primitives (strings, numbers, booleans, null).
+- Arrays and dictionaries thereof.
+- Bytes (up to ≤10 MB in the v1.0 MVP).
+- References to external resources expressed as URLs: `s3://bucket/key`, `file://path`.
+
+**Common "silently breaks JSON" cases**:
+
+| Type | How to serialise |
+|---|---|
+| `datetime` | ISO 8601 string (`"2026-01-01T12:00:00Z"`) |
+| `Decimal` / `BigInt` | string |
+| `set` | array |
+| `Enum` | enum value |
+| `UUID` | string (`"a1b2c3..."`) |
+
+**Exception for `in_process_only` plugins**: live objects (for example, stream objects) may be passed within a single hook invocation. Checkpoints and progress events, however, must remain serialisable.
+
+## 3. Resources via DI
+
+**Rule**: HTTP clients, database connections, and connection pools are **injected** through `ctx.resources`; they are not constructed inside the plugin.
+
+The details live on a dedicated page, [Resources (Resources DI)](./resources).
+
+## 4. Explicit `execution_model`
+
+**Rule**: the plugin declares its execution style in the manifest. The host picks an appropriate executor.
+
+```toml
+execution_model = "async"
+# or
+execution_model = "sync"
+execution_model = "thread_cpu_bound"
+execution_model = "process_cpu_bound"
+```
+
+**Consequences**:
+
+- A **`sync` plugin must not block on I/O** — the host verifies this with specialised tooling (in Python, `blockbuster`).
+- An **`async` plugin must not occupy the CPU without an explicit yield** — that blocks the event loop.
+- A **`thread_cpu_bound` plugin** runs on a thread pool, not on the event loop.
+- **`process_cpu_bound`** — a separate process (for very heavy tasks).
+
+## 5. Unit of Work for long-running plugins
+
+**Rule**: a plugin whose operation takes minutes or more declares its UoW parameters in the manifest:
+
+```toml
+[plugin.unit_of_work]
+declared = true
+partition_key = "tenant_id"
+estimated_duration_sec = 600
+idempotency_mode = "input_hash"
+checkpointable = true
+```
+
+- `partition_key` — sharding key; the orchestrator parallelises units along this key.
+- `idempotency_mode` — see invariant 7.
+- `checkpointable = true` — the plugin persists progress through `ctx.checkpoint` and supports resume.
+
+UoW plugins are invoked by the orchestrator (`kind = "orchestrator"`), not directly by the application.
+
+## 6. Abstract ProgressSink / CheckpointStore
+
+**Rule**: a plugin publishes progress through the abstract `ctx.progress`, not directly through WebSocket / SSE / a log file. The same applies to `ctx.checkpoint` for persisting and restoring state.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    # ✗ Bad — a direct dependency on WebSocket.
+    class BadPlugin:
+        async def process(self):
+            await broadcast_to_websocket({"event": "progress", "percent": 50})
+
+    # ✓ Good — through the abstract sink.
+    class GoodPlugin:
+        async def process(self):
+            self._progress.update(percent=0.5, message="Halfway there")
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    // ✗ Bad — direct dependency on a transport.
+    export class BadPlugin {
+      async process(): Promise<void> {
+        await broadcastToWebSocket({ event: "progress", percent: 50 });
+      }
+    }
+
+    // ✓ Good — through the abstract sink injected via PluginContext.
+    export class GoodPlugin {
+      private progress!: ProgressSink;
+
+      async setup(ctx: PluginContext): Promise<void> {
+        this.progress = ctx.resources.get<ProgressSink>("progress");
+      }
+
+      async process(): Promise<void> {
+        this.progress.update({ percent: 0.5, message: "Halfway there" });
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    func (p *GoodPlugin) Process() error {
+        p.progress.Update(0.5, "Halfway there", nil)
+        return nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+The host plugs in different sink implementations:
+
+- In a web application — a WebSocket broadcast.
+- In an orchestrator op — a stream into the orchestrator's state.
+- In a unit test — appending to an array for assertions.
+
+## 7. Idempotency modes
+
+**Rule**: a UoW plugin declares its `idempotency_mode`:
+
+| Mode | Semantics | When to use it |
+|---|---|---|
+| `input_hash` | A repeat with the same input → the same output. The orchestrator skips the repeat. | Indexing, data enrichment. |
+| `output_hash` | A repeat may produce a new output, but if the hash matches it counts as a single result. | Idempotent downstream updates by result hash. |
+| `none` | Every run is a new result. Deduplication is the consumer's responsibility. | Notifications, fire-and-forget. |
+
+## 8. Determinism for `output_hash`
+
+**Rule**: a plugin with `idempotency_mode = "output_hash"` must be **deterministic** — the same input plus the same resource state yields the same output.
+
+**What is forbidden**:
+
+- `time.now()` / `Date.now()` / `time.Now()` — only `ctx.resources.clock.now()`.
+- `random()` / `Math.random()` / `rand.Int()` — only `ctx.resources.rng.next(...)`.
+- Iterating a `set` without sorting.
+- Iterating an unordered `dict` / `map`.
+- Locale-dependent formatting.
+
+**How to verify determinism**: run the plugin twice with a frozen clock and a seeded RNG, then compare outputs byte by byte. If they differ, some source of non-determinism is bypassing DI.
+
+## How the contract test framework checks the invariants
+
+The Python binding (`dagstack-plugin-system >= 0.2`) ships a built-in contract test framework. Equivalent APIs in the TypeScript and Go implementations will land once they reach stable. A Python example follows:
+
+```python
+from dagstack.plugin_system import (
+    run_contract_suite,
+    assert_no_ambient_state,
+    assert_json_serializable_boundaries,
+    assert_lifecycle_clean,
+    assert_deterministic,
+    assert_manifest_valid,
+    ALL_CHECKS,
+)
+
+
+def test_my_plugin_contracts():
+    manifest = load_manifest("plugins/my-plugin/dagstack.toml")
+    result = run_contract_suite(
+        plugin_class=MyPlugin,
+        manifest=manifest,
+        checks=ALL_CHECKS,
+    )
+    assert result.ok, result.format_failures()
+```
+
+Each check covers one or more invariants:
+
+| Check | Invariants |
+|---|---|
+| `assert_manifest_valid` | 4, 5, 7 (manifest declarations) |
+| `assert_no_ambient_state` | 1 |
+| `assert_json_serializable_boundaries` | 2 |
+| `assert_lifecycle_clean` | 3 (Resources DI — no resource leaks) |
+| `assert_deterministic` | 8 |
+
+Execution details live on the [Guide: Testing plugins](../guides/testing) page.
+
+## See also
+
+- [ADR-0003: Orchestration-neutral runtime](../spec/adr/0003-runtime-invariants) — the normative contract for each invariant.
+- [Resources (Resources DI)](./resources) — invariant 3 in detail.
+- [Plugin lifecycle](../guides/lifecycle) — where each invariant applies in the lifecycle.
+- [Guide: Writing a plugin](../guides/writing-a-plugin) — a walkthrough that runs the contract tests.

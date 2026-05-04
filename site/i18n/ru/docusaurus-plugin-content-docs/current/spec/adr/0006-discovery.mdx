@@ -1,0 +1,314 @@
+---
+sidebar_position: 6
+title: ADR-0006 · File-based discovery
+description: Нормативный контракт функции discover(path) — dagstack.toml как canonical manifest, entry_point REQUIRED, namespace-isolation через importlib, правила обхода каталога.
+slug: /spec/adr/0006-discovery
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0006 · File-based discovery
+
+**Статус**: accepted v1.0 (2026-04-17) · [Полный нормативный текст](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0006-file-based-plugin-discovery.md)
+
+## Зачем отдельный механизм обнаружения
+
+[ADR-0001](./0001-core) описывает два базовых механизма регистрации плагинов:
+
+1. `register_module(module)` — программная регистрация in-tree модуля.
+2. `load_entry_points(group)` — загрузка pip-установленных плагинов через `importlib.metadata`.
+
+Оба требуют от приложения явного вызова для каждого плагина или предварительной pip-установки. На практике в приложениях плагины живут в директориях проекта:
+
+```
+plugins/
+├── llm/openai_compatible/
+│   ├── dagstack.toml
+│   └── plugin.py
+├── chunker/semantic/
+│   ├── dagstack.toml
+│   └── plugin.py
+└── tool/semantic_search/
+    ├── dagstack.toml
+    └── plugin.py
+```
+
+Добавление плагина = создание папки с `dagstack.toml` + модулем реализации. Удаление = удаление папки. Никаких правок в реестре, никаких `register_module(...)`-вызовов, никакой pip-установки.
+
+**Проблема**: без встроенного механизма обнаружения каждому приложению приходится писать свой boilerplate — обход директории, парсинг TOML, поиск entry-point, вызов register. Это повторяется в каждом приложении одинаково.
+
+ADR-0006 фиксирует нормативный контракт функции `discover(path)` — встроенного механизма folder-based обнаружения, одинакового во всех реализациях.
+
+## Ключевые требования
+
+ADR-0006 строится от шести требований:
+
+1. **Декларативность** — плагин полностью описан `dagstack.toml` + модулем реализации. Никакого boilerplate регистрации.
+2. **Convention over configuration** — фиксированная структура: `dagstack.toml` в корне плагина, `entry_point` — обязательное поле.
+3. **Composability** — несколько `discover()` вызовов (проектные + pip-installed + user-local) регистрируют в один реестр.
+4. **Multi-language** — формат `dagstack.toml` одинаков для Python, TypeScript, Go.
+5. **Namespace isolation** — загрузка через `importlib` (в Python) без загрязнения `sys.path`; аналогичные механизмы в других языках.
+6. **Hot-reload ready** — структура совместима с watch+reload без перезапуска (Phase 2+).
+
+## `dagstack.toml` — canonical manifest
+
+Каждый плагин обязан иметь `dagstack.toml` в корневой директории. `entry_point` — обязательное поле.
+
+```toml
+[plugin]
+name = "openai_compatible"
+kind = "llm"
+runtime = "in_process"
+entry_point = "plugin:OpenAIPlugin"       # REQUIRED
+priority = 0
+core_version = ">=0.2.0"
+
+[plugin.resources]
+required = ["config"]
+optional = ["http_client"]
+
+[plugin.metadata]
+description = "OpenAI-compatible LLM backend (OpenRouter, vLLM, Ollama)"
+author = "dagstack"
+license = "Apache-2.0"
+```
+
+Формат **единый** для folder-based обнаружения и pip-пакетов. Pip-установленные плагины включают `dagstack.toml` в package-data; `load_entry_points()` находит его через `importlib.resources`.
+
+**`kind` — opaque string**: plugin-system не валидирует значение `kind`; это ответственность приложения (оно регистрирует hookspecs видов, которые ожидает). Plugin-system хранит и группирует плагины по `kind`, но семантику не придаёт.
+
+## Resolution entry-point через importlib (без sys.path)
+
+`entry_point` резолвится относительно директории плагина через механизм, не требующий модификации `sys.path`. В Python — через `importlib.util.spec_from_file_location`:
+
+```python
+import importlib.util
+import sys
+
+def _load_entry_point(plugin_dir: Path, plugin_name: str, entry_point: str) -> type:
+    module_name, class_name = entry_point.split(":")
+    file_path = plugin_dir / f"{module_name}.py"
+    if not file_path.is_file():
+        raise ManifestInvalid(f"Entry point module not found: {file_path}")
+
+    qualified = f"dagstack._discovered.{plugin_name}.{module_name}"
+    spec = importlib.util.spec_from_file_location(qualified, file_path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[qualified] = mod
+    spec.loader.exec_module(mod)
+    return getattr(mod, class_name)
+```
+
+**Namespace isolation**: каждый `plugin.py` загружается в уникальный namespace `dagstack._discovered.<plugin_name>.<module>`. Коллизии невозможны, даже если все плагины называют модуль `plugin.py`. Аналогичные механизмы в других реализациях (dynamic import в Node, plugin-plugin в Go).
+
+## Сигнатура `discover()`
+
+```
+discover(
+    path: str | Path,
+    *,
+    recursive: bool = True,
+    ignore: list[str] | None = None,
+) -> PluginRegistry
+```
+
+**Аргументы**:
+
+- `path` — корневая директория для сканирования.
+- `recursive` (default `true`) — обходить подкаталоги. Папка с `dagstack.toml` — плагин-лист, дальше в неё не идём.
+- `ignore` — имена директорий для пропуска. По умолчанию `DEFAULT_IGNORE`.
+
+**DEFAULT_IGNORE** (рекомендуемый минимум, точное содержимое в `_meta/default_ignore.yaml`):
+
+```
+__pycache__/
+node_modules/
+.git/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+dist/
+build/
+```
+
+**Алгоритм**:
+
+1. Обход `path` рекурсивно.
+2. Сбор всех директорий, содержащих `dagstack.toml` (в каждую дальше не рекурсируем — плагин — лист).
+3. Parse всех манифестов. Проверка уникальности `(kind, name)` — дубликат бросает `AmbiguousPlugin`.
+4. Топологическая сортировка по `depends_on` для корректного порядка загрузки.
+5. В topo-order: резолв `entry_point` (см. выше), вызов `_register(manifest)`. Failure одного плагина логируется и пропускается (continue-on-failure).
+6. Возврат `PluginRegistry` с зарегистрированными плагинами.
+
+## Пример использования
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="main.py"
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+    registry = PluginRegistry()
+
+    # Project plugins.
+    registry.discover("plugins/")
+
+    # Optional — user-local plugins, registered into the same registry.
+    registry.discover("~/.config/my-app/plugins/")
+
+    # Build a PluginContext (config, logger, resources, …) and run setup.
+    ctx = PluginContext(...)
+    await registry.setup_all(ctx)
+    ```
+
+    :::note Phase 0 covers folder-based discovery only
+
+    `0.1.0-rc.2` ships `PluginRegistry.discover(path)` for in-tree plugins.
+    `load_entry_points()` (pip-installed plugins) and `merge()` (combining
+    independent registries) are reserved for Phase 1+ — until then, point
+    every `discover()` call at a single root or call `discover()` repeatedly
+    on the same registry, which appends new plugins without merging.
+
+    :::
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="main.go"
+    // Discover walks the filesystem and returns parsed manifest entries. It
+    // does NOT register them — Go's import system links plugin code at
+    // compile time, so the host instantiates each Plugin and calls
+    // RegisterManifest explicitly. This is the deliberate tradeoff with
+    // Python's importlib-based dynamic loading.
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        return err
+    }
+
+    // Optional second tree — entries from multiple Discover calls flow into
+    // the same Registry. The Phase 1 binding does not ship a separate
+    // Merge() helper; concatenate the entry slices and register them in one
+    // pass instead.
+    userEntries, _ := pluginsystem.Discover("~/.config/my-app/plugins/")
+    entries = append(entries, userEntries...)
+
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        // The host owns plugin construction: lookup the constructor by
+        // entry.Manifest.Name (or by entry.Manifest.EntryPoint as an opaque
+        // identifier) and instantiate the Plugin in-process.
+        plugin := constructPlugin(entry.Manifest)
+        if err := reg.RegisterManifest(entry.Manifest, plugin); err != nil {
+            return err
+        }
+    }
+
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        return err
+    }
+    ```
+
+    :::info Entry-point loading is host-driven in Go
+
+    The Go binding's `Discover` returns parsed `ManifestEntry` values; it does
+    **not** dynamically link plugin code (Go has no `importlib` analogue —
+    binaries link at compile time). The host maps each manifest's
+    `entry_point` to a constructor it knows about and calls
+    `Registry.RegisterManifest(entry.Manifest, plugin)`. Pip-installed-style
+    `LoadEntryPoints` is therefore not part of the Go surface — Go plugins
+    distribute as importable modules in `go.mod`, not as runtime-loadable
+    artefacts.
+
+    :::
+  </TabItem>
+</Tabs>
+
+Каждый вызов `discover()` возвращает независимый реестр; `merge()` объединяет их с проверкой уникальности `(kind, name)`. Приложение-потребитель сам решает, в каком порядке вызывать `discover()` и какие источники включать.
+
+## Соглашения о структуре каталогов
+
+```
+plugins/                           # корень, передаётся в discover()
+├── {category}/                    # необязательная группировка для человека
+│   └── {plugin_name}/            # корень плагина
+│       ├── dagstack.toml         # REQUIRED
+│       ├── plugin.py             # entry_point-модуль
+│       ├── tests/                # locally-run контрактные тесты (опционально)
+│       └── README.md             # описание плагина (опционально)
+└── {plugin_name}/                # плоская структура тоже валидна
+    ├── dagstack.toml
+    └── plugin.py
+```
+
+- **Category-директории** (`llm/`, `tool/`, `chunker/`) — группировка для человека. `kind` берётся из `dagstack.toml`, не из пути.
+- **Имя директории плагина** должно совпадать с `name` в манифесте для читаемости, но это не обязательно.
+- **`tests/` внутри плагина** — для plugin-local контрактных тестов.
+
+## Взаимодействие с другими механизмами
+
+| Механизм | Use case | Приоритет в приложении |
+|---|---|---|
+| `discover(path)` | In-project плагины, folder-based | Primary |
+| `register_module(mod)` | Программная регистрация, bridges, testing | Fallback |
+| `load_entry_points()` | pip-установленные плагины | Secondary (distribution) |
+
+Все три регистрируют в один `PluginRegistry`. Дубликаты `(kind, name)` — ошибка `AmbiguousPlugin`, не override. Для override используется `registry.override()` явно.
+
+## Миграция с существующих boilerplate-паттернов
+
+Приложения, которые до сих пор пишут свой собственный discovery-код (обход директории, парсинг TOML, регистрация), могут перейти на `discover()` инкрементально:
+
+1. Оставить существующий boilerplate для обратной совместимости, пока все плагины не перенесены на `dagstack.toml`.
+2. Новые плагины сразу создаются в `plugins/<name>/dagstack.toml + plugin.py`.
+3. Когда все плагины мигрированы — удалить boilerplate, заменить вызовом `discover("plugins/")` в lifespan.
+
+## Последствия
+
+**Положительные:**
+
+- **Zero-boilerplate** для добавления плагина — создал папку с двумя файлами, готов.
+- **Namespace isolation** через `importlib` — плагины не конфликтуют между собой, даже если используют одинаковые имена модулей.
+- **Единый формат манифеста** (`dagstack.toml`) для folder-based и pip-пакетов — pip-плагин переносится в `plugins/` копированием.
+- **Готов к hot-reload** — директорный watcher + повторный `discover()` = dev-mode в будущих фазах.
+- **Testability** — plugin-local `tests/` позволяет запускать контрактные тесты каждого плагина изолированно.
+
+**Компромиссы:**
+
+- **Relative imports между модулями плагина** ограничены `importlib`-механизмом. Смягчение: простые плагины = один модуль (`plugin.py`); сложные плагины с несколькими модулями — pip-пакет с proper package setup.
+- **Dependency resolution между разными `discover()` вызовами** — `depends_on` работает внутри одного вызова (через topo-sort). Между несколькими вызовами зависимости не учитываются — порядок вызовов определяет порядок регистрации.
+- **Security — auto-discover = auto-execute**. Любой код в `plugin.py` внутри сканированной директории будет выполнен при загрузке. Смягчение: параметр `ignore`, будущий ADR на plugin signing.
+
+**Что запрещено этим ADR**:
+
+- Modify `sys.path` при загрузке плагина — нормативно запрещено, чтобы не ломать изоляцию namespaces.
+- Резолвить `entry_point` относительно `sys.path` — только через `importlib.util.spec_from_file_location` (в Python) или эквивалент в других языках.
+- Интерпретировать `kind` в plugin-system core — это opaque string, семантику придаёт приложение-потребитель.
+
+## Связанные ADR
+
+- [ADR-0001](./0001-core) — базовые механизмы регистрации, которые ADR-0006 расширяет folder-based вариантом.
+- [ADR-0004](./0004-hookspec) — `dagstack.toml` использует hookspec-контракты для валидации манифеста.
+
+## Нормативный источник
+
+Полный текст ADR-0006 с формальным алгоритмом обхода каталога, namespace-resolution pseudo-code, разбором resolved и open questions: [`plugin-system-spec/adr/0006-file-based-plugin-discovery.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0006-file-based-plugin-discovery.md).
+
+Полный список `DEFAULT_IGNORE` — в [`_meta/default_ignore.yaml`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta) spec-репозитория.

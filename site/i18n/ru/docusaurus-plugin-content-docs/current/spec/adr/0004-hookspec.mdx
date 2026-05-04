@@ -1,0 +1,261 @@
+---
+sidebar_position: 4
+title: ADR-0004 · Формализм hookspec
+description: Hookspec как источник истины для контрактов видов плагинов — YAML-обёртка поверх JSON Schema, генерация типов для Python/TypeScript/Go/OpenRPC/Markdown, CI-gate против дрейфа.
+slug: /spec/adr/0004-hookspec
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0004 · Формализм hookspec
+
+**Статус**: accepted v1.0 (2026-04-16) · [Полный нормативный текст](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0004-hookspec-formalism.md)
+
+## Зачем формализм
+
+`dagstack/plugin-system` — многоязычная система. Реализации на Python (pluggy + pydantic), TypeScript (zod), Go (planned). Все реализации должны разделять:
+
+- Один формат манифеста плагина.
+- Один набор видов плагинов (`tool`, `orchestrator`, будущие `vector_store`, `chunker`, `llm`, …).
+- Одинаковые сигнатуры хуков для каждого вида (имя, аргументы с типами, тип возврата).
+- Одинаковую семантику диспетчеризации (пять классов, зафиксированных в [ADR-0002](./0002-hook-invocation)).
+- Один MCP wire-протокол (JSON-RPC 2.0 поверх stdio/HTTP) для cross-process плагинов.
+
+**Проблема**: откуда берётся этот контракт? Если каждый binding пишет свои hand-typed модели — через год они разойдутся: типы расходятся, имена хуков не совпадают, семантика расходится в мелочах.
+
+ADR-0004 фиксирует hookspec как **единственный источник истины** для контрактов видов плагинов и механизм генерации типов для каждой реализации из этого источника.
+
+## Решение — гибрид YAML + JSON Schema
+
+Источник истины — **два файла на каждую версию каждого вида плагина**:
+
+1. **Hookspec YAML** (`kinds/<kind>/v<N>.yaml`) — тонкая обёртка, описывает:
+   - Имя вида, его версию (`kind_api_version`).
+   - Список хуков вида: имя, класс диспетчеризации, описание.
+   - Ссылки на JSON Schema для входов и выходов каждого хука.
+   - Флаги `mcp_exposed` (участие в MCP wire), `mcp_tool_name_template` (шаблон имени MCP-tool).
+2. **JSON Schema 2020-12** (`kinds/<kind>/schemas/*.json`) — описывает структуру payloads входов и выходов хуков по стандарту JSON Schema.
+
+YAML-обёртка — **≈200 строк парсера**. JSON Schema — стандарт, готовые validators и generators есть для всех языков.
+
+## Минимальный пример hookspec
+
+```yaml title="kinds/tool/v1.yaml"
+kind: tool
+kind_api_version: 1.0.0
+description: |
+  Function-style плагин: один или несколько исполняемых хуков, каждый
+  принимает структурированные аргументы, возвращает структурированный результат.
+
+hooks:
+  - name: get_schema
+    dispatch: broadcast_collect
+    description: Список JSON-схем (по одной на плагин — схема входа execute).
+    input_schema: schemas/empty.json
+    output_schema: schemas/get_schema.output.json
+    mcp_exposed: false
+
+  - name: execute
+    dispatch: singleton
+    description: Выполнить tool с аргументами.
+    input_schema: schemas/execute.input.json
+    output_schema: schemas/execute.output.json
+    mcp_exposed: true
+    mcp_tool_name_template: "{kind}.{plugin}.{hook}"
+```
+
+## Pipeline эмиттеров
+
+Из одного hookspec-файла генерируются артефакты для каждой реализации:
+
+```
+spec/kinds/tool/v1.yaml + schemas/*.json
+        │
+        ├─► emitters/python_pydantic.py
+        │   → plugin-system-python/_generated/kinds/tool/v1.py
+        │   (pydantic-модели + Protocol-класс + decorators семантики)
+        │
+        ├─► emitters/typescript_zod.ts
+        │   → plugin-system-typescript/src/_generated/kinds/tool/v1.ts
+        │   (zod-схемы + interface + метаданные диспетчера)
+        │
+        ├─► emitters/openrpc.py
+        │   → docs/openrpc/tool-v1.json
+        │   (читают MCP-серверы для tool-registration)
+        │
+        └─► emitters/markdown.py
+            → docs/kinds/tool-v1.md
+            (человекочитаемая документация вида)
+```
+
+Эмиттеры — **детерминистические**: для одного и того же hookspec output byte-equal во всех запусках. В CI каждой реализации прописана проверка:
+
+```bash
+make emit && git diff --exit-code
+```
+
+Если изменение hookspec не вызвало regenerate, или regenerate дал другой output — CI красный. Это делает **дрейф исходников от нормативной спецификации невозможным** — в каждом коммите binding-реализация согласована со спецификацией.
+
+## Где каждый артефакт живёт
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugin-system-python/src/dagstack/plugin_system/_generated/kinds/tool/v1.py"
+    # Automatically generated from kinds/tool/v1.yaml
+    # Do not edit by hand.
+    from typing import Protocol, runtime_checkable
+    from pydantic import BaseModel
+
+
+    class ExecuteInput(BaseModel):
+        name: str
+        args: dict[str, object]
+
+
+    class ExecuteOutput(BaseModel):
+        result: object
+        elapsed_ms: int
+
+
+    @runtime_checkable
+    class ToolPlugin(Protocol):
+        def get_schema(self) -> list[dict]:  # broadcast_collect
+            ...
+
+        def execute(self, input: ExecuteInput) -> ExecuteOutput:  # singleton
+            ...
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts title="plugin-system-typescript/src/_generated/kinds/tool/v1.ts"
+    // Automatically generated from kinds/tool/v1.yaml
+    // Do not edit by hand.
+    import { z } from "zod";
+
+    export const ExecuteInput = z.object({
+      name: z.string(),
+      args: z.record(z.any()),
+    });
+    export type ExecuteInput = z.infer<typeof ExecuteInput>;
+
+    export const ExecuteOutput = z.object({
+      result: z.any(),
+      elapsed_ms: z.number().int(),
+    });
+    export type ExecuteOutput = z.infer<typeof ExecuteOutput>;
+
+    export interface ToolPlugin {
+      getSchema(): Array<Record<string, unknown>>; // broadcast_collect
+      execute(input: ExecuteInput): Promise<ExecuteOutput>; // singleton
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugin-system-go/generated/kinds/tool/v1/tool.go"
+    // Automatically generated from kinds/tool/v1.yaml
+    // Do not edit by hand.
+    package tool
+
+    type ExecuteInput struct {
+        Name string         `json:"name"`
+        Args map[string]any `json:"args"`
+    }
+
+    type ExecuteOutput struct {
+        Result    any `json:"result"`
+        ElapsedMs int `json:"elapsed_ms"`
+    }
+
+    type ToolPlugin interface {
+        // broadcast_collect
+        GetSchema() ([]map[string]any, error)
+
+        // singleton
+        Execute(input ExecuteInput) (ExecuteOutput, error)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Во всех трёх реализациях:
+
+- Типы входов/выходов одинаковые (имена полей, их типы).
+- Классы диспетчеризации указаны в комментариях / декораторах.
+- Файл помечен «автосгенерирован, не редактировать вручную».
+
+Это гарантирует: плагин, написанный под `ToolPlugin` в Python, совместим с ядром, ожидающим `ToolPlugin` в TypeScript — поля `execute(input)` сериализуются одинаково.
+
+## Phase 0 — что фиксируется сейчас
+
+Наиболее трудно-откатываемые решения зафиксированы уже в v1.0:
+
+1. **Закрытый enum классов диспетчеризации** — `singleton | broadcast_collect | broadcast_notify | chain | capability`. Расширение — только через новый ADR.
+2. **Семантика `kind_api_version`** — SemVer: major-bump = breaking, плагины обязаны обновить декларацию в манифесте.
+3. **MCP tool naming convention** — `{kind}.{plugin}.{hook}`. Фиксирован в `_meta/`.
+4. **Соглашение по именам хуков** — `snake_case` в YAML-спеке; реализации конвертируют в идиомы языка (`camelCase` в TS).
+5. **Существующие виды (`tool`, `orchestrator`)** описаны как v1.0.0.
+6. **Python-emitter рабочий** + TypeScript-emitter с одним хуком как доказательство, что YAML не Python-biased.
+
+Отложено в Phase 1+:
+
+- Go-emitter (появится вместе с Go core).
+- Capability-dispatch primitives в YAML (сейчас объявляется в манифесте плагина, не в hookspec).
+- CI-tooling для backward-compat schema diff (сейчас — вручную в ревью).
+
+## Отклонённые альтернативы
+
+| Альтернатива | Почему отклонена |
+|---|---|
+| **TypeSpec** (Microsoft IDL) | Go-emitter не первоклассный; community-decorators под наши Singleton/Broadcast/Chain нет. Возможно переосмыслить через 1–2 года. |
+| **Чистый OpenRPC** | Использован как **emit-target**, не источник правды: не знает семантических примитивов (Singleton/Broadcast), неудобно версионировать per-kind. |
+| **OpenAPI 3.1** | REST-centric, неестественно описывать функции через `operations`. |
+| **Protobuf + gRPC** | Свой wire-формат ломает MCP JSON-совместимость; tooling-heavy. |
+| **JSON Schema без обёртки** | Описывает данные, не функции; для hook → list-of-methods семантика потребуется в параллельном файле → возвращаемся к обёртке. |
+| **Custom IDL без JSON Schema base** | Изобретение payload-языка с нуля; теряем готовые validators, generators, IDE-tooling для JSON Schema. |
+
+## Lock-in — что дорого переделать
+
+| Решение | Откатить |
+|---|---|
+| JSON Schema как payload contract | **Дёшево** — lingua franca, конвертится в почти всё. |
+| Custom YAML wrapper | **Дёшево** — ~200 строк парсера, миграция в TypeSpec механическая. |
+| OpenRPC как emit-target | **Бесплатно** — re-emit. |
+| Hook naming + kind_api versioning | **Дорого** — это binding-контракт со всеми существующими плагинами. Зафиксирован в Phase 0. |
+| Взяли бы TypeSpec сейчас | Дорого — tied to Microsoft-roadmap. |
+| Взяли бы Protobuf | Очень дорого — wire-format меняется, все клиенты ломаются. |
+
+## Последствия
+
+**Положительные:**
+
+- Один источник истины для контрактов на три+ языка; изменение в YAML автоматически распространяется на все реализации.
+- Generated-файлы зафиксированы в репо — пользователи видят их в diffs, не зависят от build-pipeline.
+- MCP autoport — OpenRPC автоматически регистрирует все `mcp_exposed: true` хуки без ручного списка.
+- Документация генерируется бесплатно — markdown emit из того же YAML.
+- Migration path к другому IDL (TypeSpec, когда дозреет) остаётся открытым через механический rewrite YAML.
+
+**Компромиссы:**
+
+- Кастомный формат требует поддержки парсера (~200 строк) и эмиттеров (~150–300 строк каждый).
+- Generated-файлы в репо = больше шума коммитов при изменениях. Смягчение: CI-gate `git diff --exit-code` гарантирует sync + auto-PR для regenerate.
+- Ограничение в 5 фиксированных классов диспетчеризации — добавление нового класса требует ADR, а не просто смены enum.
+
+**Что запрещено этим ADR**:
+
+- Binding не может добавить свой тип диспетчеризации, которого нет в `_meta/dispatch_classes.yaml`.
+- Binding не может вручную переопределить сигнатуру хука в `_generated/` — CI-gate `git diff --exit-code` это ловит.
+- Hook-spec не может описывать payload вне JSON Schema 2020-12 (никаких custom-примитивов для типов).
+
+## Связанные ADR
+
+- [ADR-0001](./0001-core) — манифест плагина использует типы, эмитируемые из hookspec.
+- [ADR-0002](./0002-hook-invocation) — классы диспетчеризации перечислены в закрытом enum `_meta/dispatch_classes.yaml`, на который ссылается hookspec.
+- [ADR-0003](./0003-runtime-invariants) — `execution_model` в hookspec описывает стиль исполнения хука.
+- [ADR-0005](./0005-horizontal-hooks) — использует тот же формализм для объявления горизонтальных хуков.
+
+## Нормативный источник
+
+Полный текст ADR-0004 с архитектурным обоснованием, сравнительной таблицей альтернатив и детальным Implementation plan: [`plugin-system-spec/adr/0004-hookspec-formalism.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0004-hookspec-formalism.md).
+
+Источники для эмиттеров живут в директории [`_meta/`](https://github.com/dagstack/plugin-system-spec/tree/main/_meta) spec-репозитория.

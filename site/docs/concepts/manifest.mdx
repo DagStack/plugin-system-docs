@@ -1,0 +1,214 @@
+---
+sidebar_position: 2
+title: Plugin manifest
+description: The dagstack.toml schema — required and optional fields, kinds, runtimes, and resource requirements.
+slug: /concepts/manifest
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Plugin manifest
+
+The manifest is the `dagstack.toml` file at the root of a plugin folder. It declares the plugin's metadata and its requirements on the execution environment. The manifest is the **single source of truth** for discovery: a plugin without a manifest is invisible to the registry, even if its code is correct.
+
+## Minimal manifest
+
+```toml title="plugins/my-plugin/dagstack.toml"
+[plugin]
+schema_version = "1"
+name = "my-plugin"
+kind = "tool"
+kind_api_version = "1"
+core_version = ">=0.1.0,<1.0.0"
+runtime = "in_process"
+license = "Apache-2.0"
+entry_point = "plugin:MyPlugin"
+```
+
+These are the minimum fields the loader requires. Optional metadata follows below.
+
+## Required fields
+
+| Field | Type | Description |
+|---|---|---|
+| `schema_version` | string | Manifest schema version — `"1"` for ADR-0001. |
+| `name` | string | Plugin name, unique within its `kind`. Lower-case letters, digits, hyphen, underscore. |
+| `kind` | string | Plugin kind — which contract the plugin implements. Examples: `llm`, `vector_store`, `chunker`, `pipeline`, `tool`, `orchestrator`. |
+| `kind_api_version` | string | The kind-contract version this plugin implements (e.g. `"1"`). |
+| `runtime` | string | Execution runtime: `in_process`, `mcp_stdio`, `mcp_http`. |
+| `core_version` | string | Compatible plugin-system core version range. Python parses this as a PEP 440 specifier (`>=0.1.0,<1.0.0`); Go parses the same string as a SemVer range. |
+| `entry_point` | string | `module:Class` form. The loader resolves `module` to `<plugin-dir>/<module>.py` and imports `Class` (ADR-0006 §2). |
+
+## Optional fields
+
+### Metadata
+
+```toml
+[plugin]
+schema_version = "1"
+name = "qdrant"
+kind = "vector_store"
+kind_api_version = "1"
+core_version = ">=0.1.0,<1.0.0"
+runtime = "in_process"
+entry_point = "plugin:QdrantStore"
+license = "Apache-2.0"
+maintainer = "Dagstack Contributors <hi@example.org>"
+homepage = "https://example.org/qdrant-plugin"
+```
+
+The Phase 0 manifest model uses pydantic with `extra="forbid"` — only the fields above are accepted. Extended metadata (`version`, `description`, `authors`, free-form keywords) lands in Phase 2 together with the manifest-schema bump.
+
+### Capabilities
+
+Used by `CapabilityDispatcher` to pick a plugin that fits the request. Capabilities are arbitrary string identifiers; their semantics are defined per kind.
+
+```toml
+[plugin]
+schema_version = "1"
+name = "semantic-chunker"
+kind = "chunker"
+kind_api_version = "1"
+core_version = ">=0.1.0,<1.0.0"
+runtime = "in_process"
+entry_point = "plugin:SemanticChunker"
+capabilities = ["treesitter", "python", "typescript", "go"]
+```
+
+### Resources
+
+A plugin declares which system resources it needs. The registry injects them through `inject_resources` before calling `setup`.
+
+```toml
+[plugin]
+schema_version = "1"
+name = "sha-tagger"
+kind = "tool"
+kind_api_version = "1"
+core_version = ">=0.1.0,<1.0.0"
+runtime = "in_process"
+entry_point = "plugin:ShaTagger"
+
+[plugin.resources]
+required = ["clock", "rng", "blob_store"]
+```
+
+Resource names follow `STANDARD_RESOURCES` (snake_case): `clock`, `rng`, `blob_store`, `http_client`. In tests the standard implementations are replaced with deterministic ones: `FrozenClock`, `DeterministicRng`, `InMemoryBlobStore`.
+
+### Unit of work
+
+For plugins that participate in orchestration (Dagster, Celery, k8s), a unit of work is declared — the partitioning keys and the expected execution model.
+
+```toml
+[plugin]
+name = "file-indexer"
+kind = "pipeline"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+execution_model = "async"       # plugin hook execution style (sync | async | thread_cpu_bound | process_cpu_bound)
+
+[plugin.unit_of_work]
+declared = true
+partition_key = "repo_id"
+idempotency_mode = "input_hash"    # input_hash | output_hash | none
+checkpointable = true
+content_hash = ["tenant_id", "repo_id", "file_sha"]
+```
+
+:::note
+`execution_model` is the **execution style of the plugin's hooks** (sync/async/CPU-bound), not the dispatch class. The dispatch class (`singleton`, `broadcast_collect`, `chain`, `capability`) is declared **in the kind's hookspec** — in the `dispatch:` field of each hook. See [ADR-0004](../spec/adr/0004-hookspec) and [Dispatch classes](./dispatch).
+:::
+
+- `partition_keys` — fields the orchestrator parallelises work over.
+- `idempotent` — flag indicating that a re-run with the same `content_hash` yields the same result (the orchestrator may skip it).
+- `content_hash` — the list of fields used to compute the idempotency key.
+
+### Supported dispatcher capabilities
+
+```toml
+[plugin]
+name = "openai-embedder"
+kind = "embedder"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+supports_languages = ["en", "ru"]
+supports_mime_types = ["text/plain"]
+
+[plugin.supports]
+text = true
+image = false
+batch = true
+streaming = false
+```
+
+The `supports_*` fields are used by `CapabilityDispatcher` to select a plugin for a specific request. The decision whether to use `capability`-dispatch for a kind's hooks is taken in the kind's hookspec via the `dispatch:` field — not in the plugin manifest.
+
+## Embedding the manifest in `pyproject.toml` (Python)
+
+For Python plugins distributed as packages, the manifest contents may live in the `[tool.dagstack.plugin]` section of `pyproject.toml`. This is convenient for plugins published on PyPI, so the metadata is not duplicated.
+
+```toml title="pyproject.toml"
+[project]
+name = "dagstack-plugin-openai"
+version = "0.1.0"
+
+[tool.dagstack.plugin]
+name = "openai_compatible"
+kind = "llm"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+```
+
+Precedence: if a plugin has both `dagstack.toml` and `[tool.dagstack.plugin]` in `pyproject.toml`, `dagstack.toml` wins.
+
+## Validation
+
+Validation runs automatically during `discover`. To validate a single manifest by hand:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from pathlib import Path
+    from dagstack.plugin_system import load_manifest, assert_manifest_valid
+
+    manifest = load_manifest(Path("plugins/my-plugin/dagstack_plugin.toml"))
+    assert_manifest_valid(manifest)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { readFile } from "node:fs/promises";
+    import { PluginManifestSchema } from "@dagstack/plugin-system";
+
+    const raw = JSON.parse(await readFile("plugins/my-plugin/dagstack.json", "utf8"));
+    const manifest = PluginManifestSchema.parse(
+      "plugin" in raw ? raw.plugin : raw,
+    );
+    // throws ZodError if the document does not match the schema
+    ```
+
+    Or, in the registration path (auto-validated by `registerManifest`):
+
+    ```ts
+    import { PluginRegistry } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    const manifest = registry.registerManifest(raw, "file:my-plugin/dagstack.json");
+    // throws ManifestInvalid if validation fails
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    manifest, err := pluginsystem.LoadManifestFromFile("plugins/my-plugin/dagstack.toml")
+    if err != nil {
+        return err
+    }
+    if err := manifest.Validate(); err != nil {
+        return err
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+A schema mismatch raises `ManifestInvalid` with the path to the file and a description of the first validation error.

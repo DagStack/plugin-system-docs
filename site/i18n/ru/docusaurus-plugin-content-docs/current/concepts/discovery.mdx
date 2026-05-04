@@ -1,0 +1,251 @@
+---
+sidebar_position: 3
+title: Обнаружение плагинов
+description: Функция discover(path) — рекурсивный обход каталога, правила обнаружения dagstack.toml, исключения, ограничения.
+slug: /concepts/discovery
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Обнаружение плагинов
+
+Обнаружение — это процесс, в котором реестр находит плагины в файловой системе. Реализация опирается на файловую модель, декларированную в [ADR-0006](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0006-file-based-plugin-discovery.md): плагин — это **папка с `dagstack.toml`**. Всё остальное — детали реализации.
+
+## Структура каталога
+
+```
+my-app/
+├── plugins/
+│   ├── openai/
+│   │   ├── dagstack.toml
+│   │   └── plugin.py
+│   ├── qdrant/
+│   │   ├── dagstack.toml
+│   │   └── plugin.py
+│   └── echo/
+│       ├── dagstack.toml
+│       └── plugin.py
+└── main.py
+```
+
+Каждая папка с файлом `dagstack.toml` становится одним плагином. Вложенные папки плагинов **не** поддерживаются — плагин нельзя положить внутрь другого плагина.
+
+## Вызов обнаружения
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+
+    async def main() -> None:
+        registry = PluginRegistry()
+        registry.discover("plugins/")
+
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("app"),
+            registry=registry,
+        )
+        await registry.setup_all(ctx)
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    ctx := context.Background()
+
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        return err
+    }
+
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        if err := reg.RegisterManifest(entry.Manifest, buildPlugin(entry.Manifest)); err != nil {
+            return err
+        }
+    }
+
+    pluginCtx := &pluginsystem.PluginContext{
+        Logger:   slog.Default(),
+        Registry: reg,
+    }
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        return err
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Относительные пути трактуются относительно текущей рабочей директории процесса. В production рекомендуется указывать абсолютный путь или путь относительно известного корня приложения.
+
+## Правила обнаружения
+
+1. Обход — **рекурсивный** от указанной папки вниз. Глубина не ограничена.
+2. В каждой папке проверяется наличие `dagstack.toml`. Если файл есть — папка становится плагином; содержимое папки дальше не сканируется (вложенные плагины запрещены).
+3. Папки без `dagstack.toml` — прозрачно прокидываются дальше. Это позволяет группировать плагины по тематическим подпапкам (`plugins/data-sources/`, `plugins/llm/`).
+4. Плагины с одинаковой парой `kind+name` — ошибка `AmbiguousPlugin`. Имя должно быть уникальным в пределах вида.
+
+## Игнорируемые пути
+
+По умолчанию обнаружение пропускает системные и служебные папки:
+
+```
+__pycache__/
+node_modules/
+.git/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+dist/
+build/
+```
+
+Полный список доступен в константе `DEFAULT_IGNORE`. Для добавления собственных правил используйте параметр `ignore`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import PluginRegistry
+    from dagstack.plugin_system import DEFAULT_IGNORE
+
+    registry = PluginRegistry()
+    registry.discover(
+        "plugins/",
+        ignore=[*DEFAULT_IGNORE, "experimental/*", "*.draft"],
+    )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    entries, err := pluginsystem.Discover("plugins/",
+        pluginsystem.WithExclude(append(pluginsystem.DefaultIgnoreDirs, "experimental", "drafts")...),
+    )
+    ```
+  </TabItem>
+</Tabs>
+
+Шаблоны поддерживают glob-синтаксис (`*`, `**`, `?`).
+
+## Обнаружение нескольких корней
+
+Если приложение объединяет плагины из нескольких независимых папок (например, core-плагины рядом с main.py и плагины пользователя в `~/.config/my-app/plugins/`), можно выполнить `discover` по каждому корню и слить результаты:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    :::warning `merge` is planned for Phase 2
+    Today the Python binding accepts a single discovery root per `PluginRegistry`. Combining several roots — and the matching `merge` / `override` semantics described below — is planned for Phase 2. For now, lay your plugins out under one discovery root and call `registry.discover("plugins/")` once.
+    :::
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::warning Multi-root merge is planned for Phase 2
+    `go.dagstack.dev/plugin-system v0.1.0-rc.1` exposes a single `Discover()` per root and a single `NewRegistry()` per process. Multi-root merge with conflict-aware `kind+name` resolution lands together with the Python `merge` API in Phase 2. For now, call `Discover()` against several roots in sequence and `RegisterManifest()` each entry into one registry — duplicates surface as `ErrAmbiguousPlugin` from `RegisterManifest`.
+    :::
+  </TabItem>
+</Tabs>
+
+`merge` выбрасывает `AmbiguousPlugin`, если в двух реестрах есть плагин с одинаковой парой `kind+name`. Для конфликта типа «пользователь переопределяет системный плагин» используйте явный `override` (см. ниже).
+
+## Переопределение плагинов
+
+Иногда нужно подменить плагин для тестов или локальной разработки. Вместо `merge` используйте `override`:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    :::warning `override` is planned for Phase 2
+    Today the Python binding does not provide an explicit override flow — discovery is single-rooted. To swap a plugin out for tests, point a test-only registry at a fixture folder (`registry.discover("tests/fixtures/plugins/")`) and use it directly. The conflict-aware `override` API lands together with `merge` in Phase 2.
+    :::
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::warning Override is planned for Phase 2
+    `go.dagstack.dev/plugin-system v0.1.0-rc.1` does not yet provide an explicit override flow. To swap a plugin out for tests, point a separate `pluginsystem.NewRegistry()` at a fixture root (`Discover("tests/fixtures/plugins/")`) and use it directly in the test. The conflict-aware `Override` helper lands together with `Merge` in Phase 2.
+    :::
+  </TabItem>
+</Tabs>
+
+При `override` конфликты не считаются ошибкой — запись из второго реестра заменяет запись из первого.
+
+## Производительность
+
+Для больших каталогов (≥1000 плагинов) обход занимает заметное время. Рекомендации:
+
+- Запускайте `discover` один раз при старте приложения, результат кэшируйте.
+- Используйте `ignore` для исключения заведомо бесплагинных папок (tests, docs).
+- Если плагины известны заранее — передавайте явный список путей вместо рекурсивного обхода.

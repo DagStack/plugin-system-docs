@@ -1,0 +1,339 @@
+---
+sidebar_position: 5
+title: ADR-0005 · Horizontal extensions
+description: Five extension points of plugin-system for governance / quota / observability — open metadata slot, chain middleware, resource decoration, capability filtering, trace-context propagation.
+slug: /spec/adr/0005-horizontal-hooks
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ADR-0005 · Horizontal extensions
+
+**Status**: accepted v1.0 (2026-04-16) · [Full normative text](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0005-extensibility-hooks-for-horizontal-concerns.md)
+
+## Why a separate ADR for cross-cutting concerns
+
+dagstack is an umbrella brand for AI/ML infrastructure. Plugin-system is the bottom layer; higher-level products are planned on top of it:
+
+- **governance / iam** — permissions per `(tenant, plugin, action)` triple, audit logs.
+- **quota / metering** — accounting for consumption (LLM tokens, vector-DB writes, storage volume) per tenant, plus enforcement of limits.
+- **observability** — uniform traces / metrics / structured logs across all plugins and orchestrators.
+- **tenancy** — multi-tenant scoping of resources.
+
+These products live in separate spec repositories and bindings, but plug into plugin-system as middleware plugins or resource decorators. **Problem**: if the plugin-system core knows nothing about tenant / actor / quota, adding them later becomes a breaking change for every hookspec (the tenant context would need to be threaded through as an argument to every hook).
+
+ADR-0005 pins down **five extension points** through which horizontal products plug into plugin-system **without modifying the core**. This lets the higher-level products evolve in parallel with plugin-system, without blocking each other.
+
+**This ADR does NOT define**: the tenancy model, the IAM permission model, the quota model, observability backends, the audit-log schema — each lives in its own product spec and is resolved there.
+
+## The five extension points
+
+### 1. `PluginContext.metadata` — open key-value slot
+
+`PluginContext` (from [ADR-0001](./0001-core)) MUST contain the field:
+
+| Field | Type | Semantics |
+|---|---|---|
+| `metadata` | immutable `Mapping<string, any>` | Open key-value slot for cross-cutting concerns. The plugin-system core **does not interpret** the keys — middleware reads and writes them. |
+
+**Canonical keys** (reserved for horizontal products):
+
+| Key | Writer | Reader | Purpose |
+|---|---|---|---|
+| `tenant_id` | governance middleware | I/O plugins, resources | Tenant scope of the current invocation. |
+| `actor` | iam middleware | governance middleware, audit | Subject identity (user / service). |
+| `quota_budget` | quota middleware | I/O plugins (optional) | Remaining budget per `(tenant, resource_type)`. |
+| `trace_context` | observability middleware | I/O plugins, resources | W3C Trace Context (`traceparent` + `tracestate`). |
+| `request_id` | host runtime | everyone | Correlation in logs. |
+
+The list is **open**: new keys are added through an ADR in the spec repository of the relevant horizontal product, not in plugin-system.
+
+**Constraints**:
+
+- `metadata` MUST be **serialisable** (so it can be propagated across runtimes through `mcp_stdio` / `mcp_http`). Do not stash complex objects with methods or references to host state in it.
+- **The plugin author MUST NOT rely on the presence of any specific key**. If a key is missing, the plugin runs without that feature — it does not crash.
+
+### 2. Chain dispatch as the canonical middleware mechanism
+
+[ADR-0002](./0002-hook-invocation) §4 already pins down the `chain` dispatch class: `output[N]` becomes `input[N+1]`, strict order by `priority desc`. ADR-0005 **canonises** `chain` as the primary mechanism for horizontal middleware.
+
+Example "governance + quota as chain middleware around an ordinary tool plugin":
+
+```
+hookspec: tool.execute (singleton)
+  ↓
+governance plugin (chain, priority=1000):
+  • reads ctx.metadata["tenant_id"], ctx.metadata["actor"]
+  • checks permission(actor, tool=name, action="execute")
+  • deny → throw PermissionDenied (chain aborts)
+  • allow → forwards input unchanged
+  ↓
+quota plugin (chain, priority=500):
+  • checks ctx.metadata["quota_budget"][tool.kind]
+  • budget == 0 → throw QuotaExceeded
+  • forwards input downstream
+  ↓
+target tool plugin (singleton, priority=0):
+  • performs execute
+  ↓
+quota plugin post-hook:
+  • increments usage based on the result
+  ↓
+governance plugin post-hook:
+  • writes the audit log
+```
+
+**Additions of this ADR on top of ADR-0002**:
+
+- The plugin-system core MUST support chain wrapping for **any** dispatch class, not only for hooks that explicitly declare `chain` in the hookspec. That is, a governance plugin MAY plug into **every hook** through the priority-based chain layer that the core applies automatically.
+- The `priority` range `[1000, ∞)` is **reserved** for horizontal middleware. A plugin author MUST NOT use this range for business plugins. A contract test verifies this.
+
+### 3. Resource decoration
+
+[ADR-0003](./0003-runtime-invariants) §3 pins down Resources DI: HTTP clients, DB clients and blob stores are injected by the host through `PluginContext.resources`. ADR-0005 adds an invariant:
+
+> Resources MUST support **decoration** through wrapping: the host runtime or a middleware plugin MAY return a proxy object that implements the same interface, delegates calls to the original, and adds cross-cutting logic (metering, rate limiting, audit).
+
+Example "quota as a resource decorator":
+
+```
+manifest: tool requires resources = ["llm_client", "vector_store"]
+  ↓
+the host runtime assembles resources:
+  llm_client = OriginalLLMClient(...)
+  vector_store = OriginalVectorStore(...)
+  ↓
+the quota middleware asks the registry for decorators at resolve time:
+  llm_client = QuotaTracker(llm_client, budget=ctx.metadata["quota_budget"]["tokens"])
+  vector_store = QuotaTracker(vector_store, budget=ctx.metadata["quota_budget"]["vector_writes"])
+  ↓
+the plugin calls llm_client.chat(...):
+  QuotaTracker.chat() increments the counter before forwarding the call
+  to OriginalLLMClient.chat()
+```
+
+**Constraint**: the resource interface MUST be formally specified (Protocol / interface), otherwise decoration breaks type safety. Every plugin kind that declares a resource MUST publish its interface in the spec.
+
+### 4. Governance-driven filtering through capability dispatch
+
+[ADR-0002](./0002-hook-invocation) §5 pins down `capability` dispatch: a single request is routed to a single plugin with a matching capability declaration. ADR-0005 adds the use case:
+
+> The host runtime MAY restrict the set of allowed plugins for a given invocation based on `ctx.metadata["tenant_id"]` (or another governance key). The resulting set = capability declarations of all plugins of the kind ∩ governance policy. From it capability dispatch picks the final executor.
+
+Example "PII-safe routing":
+
+```
+manifest: tool-plugin-A has capability = ["pii_handling"]
+manifest: tool-plugin-B has capability = []  (cannot handle PII)
+
+governance policy:
+  tenant="acme-healthcare" allowed_plugins where capability ⊇ {"pii_handling"}
+  ↓
+host filters the registry → candidates = [tool-plugin-A]
+  ↓
+capability dispatch picks tool-plugin-A by input matcher
+```
+
+The plugin-system core **does not implement filtering** itself — it only publishes capability declarations and accepts a filter callback from the host. The governance product registers the filter through chain middleware (see §2).
+
+### 5. Trace-context propagation
+
+[ADR-0003](./0003-runtime-invariants) already requires propagation of W3C Trace Context. ADR-0005 makes the mechanism concrete:
+
+- Trace context lives in `ctx.metadata["trace_context"]` — W3C strings (`traceparent` + `tracestate`), MUST be serialisable.
+- The `mcp_stdio` and `mcp_http` adapters MUST propagate trace context across the protocol boundary (HTTP headers / JSON-RPC params).
+- Resources MUST accept `trace_context` through decoration (see §3) — observability middleware wraps them and emits spans.
+- The plugin author MUST NOT call the tracer directly — observability middleware emits spans automatically around every hook invocation and every resource call.
+
+## Example: a minimal governance plugin as chain middleware
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```toml title="plugins/governance-middleware/dagstack.toml"
+    [plugin]
+    name = "governance"
+    kind = "horizontal_middleware"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+
+    # Priority in the horizontal range — runs ahead of business plugins.
+    priority = 1000
+
+    # Declares that the plugin wants to participate in the chain around every hook of every kind.
+    [plugin.chain_wrap]
+    kinds = ["*"]          # all plugin kinds
+    hooks = ["*"]          # all hooks of each kind
+    ```
+
+    ```python title="plugins/governance-middleware/plugin.py"
+    from dagstack.plugin_system import PluginContext
+
+
+    class PermissionDenied(Exception):
+        """Raised by a governance binding when a policy check rejects the call."""
+
+
+    class GovernanceMiddleware:
+        async def setup(self, context: PluginContext) -> None:
+            self._policy = load_policy()  # from a governance-spec binding
+
+        def before(self, ctx: PluginContext, kind: str, name: str, hook: str, args: dict) -> dict:
+            tenant_id = ctx.metadata.get("tenant_id")
+            actor = ctx.metadata.get("actor")
+            if tenant_id is None or actor is None:
+                # If the governance middleware runs without metadata — silently pass through.
+                return args
+            if not self._policy.allow(actor, tenant_id, kind, name, hook):
+                raise PermissionDenied(
+                    f"actor={actor.id} tenant={tenant_id} kind={kind} hook={hook}",
+                )
+            return args
+
+        def after(self, ctx: PluginContext, kind: str, name: str, hook: str, result: object) -> None:
+            self._audit_log(ctx=ctx, kind=kind, name=name, hook=hook, result=result)
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { ChainDispatcher, BroadcastNotifyDispatcher } from "@dagstack/plugin-system";
+
+    type Request = { id: string; path: string };
+
+    // Horizontal extensibility via dispatchers — output → next input for chain,
+    // fire-and-forget fan-out for broadcast_notify.
+    const requestRewriters = new ChainDispatcher<Request>("request_rewriter");
+    const lifecycleListeners = new BroadcastNotifyDispatcher("lifecycle_listener");
+
+    const rewritten = await requestRewriters.dispatch(
+      registry.getLoadedPlugins(),
+      "rewrite",
+      request,
+    );
+    await lifecycleListeners.dispatch(
+      registry.getLoadedPlugins(),
+      "onRequestStarted",
+      { requestId: rewritten.id, path: rewritten.path },
+    );
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```toml title="plugins/governance-middleware/dagstack.toml"
+    [plugin]
+    name = "governance"
+    kind = "horizontal_middleware"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 1000
+
+    [plugin.chain_wrap]
+    kinds = ["*"]
+    hooks = ["*"]
+    ```
+
+    ```go title="plugins/governance-middleware/plugin.go"
+    package governance
+
+    import (
+        "context"
+        "errors"
+        "fmt"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    // ErrPermissionDenied is returned by the governance middleware when a
+    // policy check rejects the call. The host runtime that wires the chain
+    // surfaces it back to the caller.
+    var ErrPermissionDenied = errors.New("governance: permission denied")
+
+    type GovernanceMiddleware struct {
+        policy Policy
+    }
+
+    func (p *GovernanceMiddleware) Unwrap() any { return p }
+
+    func (p *GovernanceMiddleware) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        p.policy = loadPolicy()
+        return nil
+    }
+
+    // Before is invoked by the host's chain runner ahead of every wrapped
+    // hook. The chain_wrap layer that delivers `kind / name / hook` is part of
+    // the ADR-0005 horizontal-extensions surface — it is not yet implemented
+    // in pluginsystem 0.1.x and lands together with the chain-wrap registry
+    // in Phase 2. Today, plug a chain hook through pluginsystem.DispatchChain
+    // and emulate the surface manually.
+    func (p *GovernanceMiddleware) Before(
+        pluginCtx *pluginsystem.PluginContext,
+        kind, name, hook string,
+        args map[string]any,
+    ) (map[string]any, error) {
+        tenantID, _ := pluginCtx.Metadata["tenant_id"].(string)
+        actor, _ := pluginCtx.Metadata["actor"].(Actor)
+        if tenantID == "" || actor.ID == "" {
+            // Governance middleware running without metadata — silently
+            // pass-through; hosts that require it must enforce earlier.
+            return args, nil
+        }
+        if !p.policy.Allow(actor, tenantID, kind, name, hook) {
+            return nil, fmt.Errorf("%w: actor=%s tenant=%s kind=%s hook=%s",
+                ErrPermissionDenied, actor.ID, tenantID, kind, hook)
+        }
+        return args, nil
+    }
+
+    func (p *GovernanceMiddleware) After(
+        pluginCtx *pluginsystem.PluginContext,
+        kind, name, hook string,
+        result any,
+    ) error {
+        return p.auditLog(pluginCtx, kind, name, hook, result)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+The plugin is wired into the chain of every hook automatically through `chain_wrap` — business plugins know nothing about its existence, but every one of their invocations passes through the permission check and audit log.
+
+## Backwards compatibility
+
+All five extension points are **additive** to the existing spec:
+
+- §1 `metadata` — a new optional field on `PluginContext`. Existing plugins ignore it.
+- §2 chain wrapping — an extension of the already-existing dispatch class. Without middleware nothing changes.
+- §3 resource decoration — an invariant over the already-existing DI mechanism.
+- §4 capability filtering — an additional callback in the registry.
+- §5 trace-context propagation — a concretisation of the existing invariant from ADR-0003.
+
+Bumping `kind_api_version` is **not required**. Bumping the manifest `schema_version` — minor (1.0 → 1.1) due to the addition of `metadata` to the `PluginContext` schema.
+
+## Consequences
+
+**Positive:**
+
+- The governance / quota / observability products evolve **in parallel** with plugin-system, without blocking each other.
+- Plugin authors write code unaware of tenancy / quota — their plugins automatically work in a multi-tenant environment as soon as governance middleware is wired in.
+- Cross-product integration through a shared contract of **canonical `metadata` keys** — governance writes `tenant_id`, quota reads it; observability writes `trace_context`, everyone reads it.
+
+**Trade-offs:**
+
+- `PluginContext.metadata` is an open dictionary with `any`-typed values. Type safety is provided by the spec of each horizontal product (which declares its canonical keys and their types), not by the plugin-system core.
+- The priority range `[1000, ∞)` for middleware is a convention, not enforcement. If a plugin author accidentally uses `priority=2000`, they get preference over governance. Mitigation: a contract test verifies that business plugins keep `priority < 1000`.
+
+**What this ADR forbids**:
+
+- A horizontal product MUST NOT require changes to the hookspec of a business plugin for its own integration — all five extension points are self-sufficient.
+- The plugin-system core MUST NOT add keys to `metadata` whose semantics it interprets itself — the core only stores and propagates them; interpretation is the middleware's responsibility.
+
+## Related ADRs
+
+- [ADR-0001](./0001-core) — `PluginContext`, to which ADR-0005 adds `metadata`.
+- [ADR-0002](./0002-hook-invocation) — the `chain` and `capability` dispatch classes that ADR-0005 canonises as a middleware mechanism.
+- [ADR-0003](./0003-runtime-invariants) — Resources DI + the trace-context invariant that ADR-0005 makes concrete.
+
+## Normative source
+
+The full text of ADR-0005, including the detail on priority reservation, backwards-compat guarantees and a discussion of open questions: [`plugin-system-spec/adr/0005-extensibility-hooks-for-horizontal-concerns.md`](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0005-extensibility-hooks-for-horizontal-concerns.md).
+
+W3C Trace Context format: https://www.w3.org/TR/trace-context/

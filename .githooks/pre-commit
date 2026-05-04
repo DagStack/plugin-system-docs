@@ -1,0 +1,43 @@
+#!/usr/bin/env bash
+# Pre-commit hook для plugin-system-docs.
+# Установка: `make hooks` (эквивалент git config core.hooksPath .githooks).
+#
+# Проверки:
+#   1. context7.json — валидный JSON.
+#   2. scrub-check — staged-файлы не содержат паттернов из .scrub-patterns.
+#
+# Пропуск: git commit --no-verify (не рекомендуется).
+
+set -eu
+
+fail=0
+
+# 1. context7.json валидность
+if git diff --cached --name-only | grep -q '^context7\.json$'; then
+  if ! python3 -c "import json; json.load(open('context7.json'))" 2>/dev/null; then
+    echo "✗ context7.json — невалидный JSON"
+    fail=1
+  else
+    echo "✓ context7.json валиден"
+  fi
+fi
+
+# 2. scrub-check — не коммитить имена внутренних сущностей.
+if [ -f .scrub-patterns ]; then
+  pattern=$(grep -v '^#' .scrub-patterns | grep -v '^$' | paste -sd '|' -)
+  if [ -n "$pattern" ]; then
+    staged=$(git diff --cached --name-only --diff-filter=d)
+    if [ -n "$staged" ]; then
+      hits=$(echo "$staged" | xargs grep -liE "$pattern" 2>/dev/null || true)
+      if [ -n "$hits" ]; then
+        echo "✗ SCRUB-LIST HIT в следующих staged-файлах:"
+        echo "$hits" | sed 's/^/  /'
+        fail=1
+      else
+        echo "✓ scrub-check чист"
+      fi
+    fi
+  fi
+fi
+
+exit "$fail"

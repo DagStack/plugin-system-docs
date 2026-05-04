@@ -1,0 +1,306 @@
+---
+sidebar_position: 1
+title: Quick start
+description: Install dagstack/plugin-system and use the plugin registry for the first time on Python, TypeScript, and Go.
+slug: /intro
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Quick start
+
+`dagstack/plugin-system` is a generic plugin registry for any application that needs pluggable extension points. Typical scenarios: data sources, event handlers, notification channels, authentication providers, pipeline steps, integrations with external systems. Plugins are discovered in a directory by their manifests, loaded into a registry, and called through one of five dispatch classes (singleton, broadcast-collect, broadcast-notify, chain, capability).
+
+:::info Release status
+- **Python**: `dagstack-plugin-system` is being prepared for PyPI; today it ships from an internal repository.
+- **TypeScript**: `@dagstack/plugin-system` `0.1.0-rc.2` ships spec-emitted types only (`VERSION`, `ToolV1`, `OrchestratorV1`); the full runtime lands in Phase 1.
+- **Go**: `go.dagstack.dev/plugin-system` `v0.1.0-rc.1` is published as a release candidate (Phase 1 in-process surface).
+:::
+
+## Installation
+
+:::warning Snippets show the planned high-level API
+The TabItem snippets across this site illustrate the **language-agnostic contract** from [ADR-0001..0006](https://github.com/dagstack/plugin-system-spec/tree/main/adr). Concrete bindings ship the same contract under slightly different names: Python today exposes `discover(registry, path)` rather than the convenience `discover(path) -> Registry` shown here, and Go uses `Discover()` returning `[]ManifestEntry` plus a separate `NewRegistry()` + `RegisterManifest()` loop. For exact, today-runnable signatures see the per-binding [API reference](./api/python).
+:::
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```bash
+    pip install dagstack-plugin-system
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```bash
+    npm install @dagstack/plugin-system
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```bash
+    go get go.dagstack.dev/plugin-system
+    ```
+  </TabItem>
+</Tabs>
+
+## Your first plugin
+
+A minimal working plugin consists of two files in a dedicated folder: a `dagstack.toml` manifest and an implementation module.
+
+### Plugin manifest
+
+The manifest declares the **kind**, **name**, **runtime**, the compatible core version (`core_version`, PEP 440 specifier), and the **entry_point** that the loader resolves to a Python class.
+
+```toml title="plugins/echo/dagstack.toml"
+[plugin]
+schema_version = "1"
+name = "echo"
+kind = "tool"
+kind_api_version = "1"
+core_version = ">=0.1.0,<1.0.0"
+runtime = "in_process"
+license = "Apache-2.0"
+entry_point = "plugin:EchoTool"
+```
+
+The `entry_point` resolves to `plugins/echo/plugin.py` and the class `EchoTool` inside it (ADR-0006 §2 — modules load into the isolated `dagstack._discovered.<name>.<module>` namespace).
+
+### Plugin implementation
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugins/echo/plugin.py"
+    from dagstack.plugin_system import PluginContext
+
+
+    class EchoPlugin:
+        """Returns the input message wrapped under the `echoed` key.
+
+        Mirrors the canonical `examples/echo_plugin.EchoTool` shipped
+        with the binding. Both sync and async `setup` / `teardown` are
+        accepted by the registry; the published example uses sync.
+        """
+
+        def setup(self, context: PluginContext) -> None:
+            self._ctx = context
+
+        def execute(self, args: dict) -> dict:
+            return {"echoed": args["msg"]}
+
+        def teardown(self) -> None:
+            self._ctx = None
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    The TypeScript binding uses `dagstack.json` instead of `dagstack.toml` (JSON is canonical for the JS ecosystem; both formats are accepted by `discover()`).
+
+    ```json title="plugins/echo/dagstack.json"
+    {
+      "plugin": {
+        "schema_version": "1.0.0",
+        "name": "echo",
+        "kind": "tool",
+        "kind_api_version": "1.0.0",
+        "core_version": "^0.2.0",
+        "runtime": "in_process",
+        "license": "Apache-2.0",
+        "entry_point": "./plugin.js#EchoPlugin"
+      }
+    }
+    ```
+
+    ```ts title="plugins/echo/plugin.ts"
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    export class EchoPlugin {
+      private ctx?: PluginContext;
+
+      async setup(ctx: PluginContext): Promise<void> {
+        this.ctx = ctx;
+      }
+
+      async execute(args: { msg: string }): Promise<{ echoed: string }> {
+        return { echoed: args.msg };
+      }
+
+      async teardown(): Promise<void> {
+        this.ctx = undefined;
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugins/echo/plugin.go"
+    package echo
+
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type EchoPlugin struct{}
+
+    func (p *EchoPlugin) Unwrap() any { return p }
+
+    func (p *EchoPlugin) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        return nil
+    }
+
+    func (p *EchoPlugin) Invoke(payload string) (string, error) {
+        return payload, nil
+    }
+
+    func (p *EchoPlugin) Teardown(ctx context.Context) error {
+        return nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Discover and load the registry
+
+Construct a `PluginRegistry`, then call `registry.discover(path)` to walk a directory recursively, find every folder that contains a `dagstack.toml`, validate the manifests, and load the plugins into the registry. The `setup_all(ctx)` method initialises each plugin while honouring inter-plugin dependencies (topological sort).
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+
+    async def main() -> None:
+        registry = PluginRegistry()
+        registry.discover("plugins/")
+
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("app"),
+            registry=registry,
+        )
+        await registry.setup_all(ctx)
+
+        for manifest in registry.list_manifests():
+            print(manifest.kind, manifest.name)
+
+        await registry.teardown_all()
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    async function main(): Promise<void> {
+      const registry = new PluginRegistry();
+      await discover(registry, "plugins/");
+      await registry.setupAll();
+
+      for (const manifest of registry.list()) {
+        console.log(manifest.kind, manifest.name);
+      }
+
+      await registry.teardownAll();
+    }
+
+    await main();
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    ctx := context.Background()
+
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        panic(err)
+    }
+
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        plugin := buildPlugin(entry.Manifest) // user-defined factory
+        if err := reg.RegisterManifest(entry.Manifest, plugin); err != nil {
+            panic(err)
+        }
+    }
+
+    pluginCtx := &pluginsystem.PluginContext{
+        Logger:   slog.Default(),
+        Registry: reg,
+    }
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        panic(err)
+    }
+    defer reg.TeardownAll(ctx)
+
+    for _, m := range reg.ListManifests() {
+        fmt.Println(m.Kind, m.Name)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Calling a plugin
+
+Plugins are retrieved from the registry by the `kind + name` pair. The returned object is a proxy that applies the dispatch rules, injects resources, and runs contract checks.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    echo = registry.get_plugin("tool", name="echo")
+    result = echo.execute({"msg": "hello"})
+    assert result == {"echoed": "hello"}
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const dispatcher = new SingletonDispatcher<{ msg: string }, { echoed: string }>("tool");
+    const result = await dispatcher.dispatch(
+      registry.getLoadedPlugins(),
+      "execute",
+      { msg: "hello" },
+    );
+    console.log(result); // { echoed: "hello" }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    p, err := reg.Resolve("echo")
+    if err != nil {
+        panic(err)
+    }
+    echo := p.Unwrap().(*echo.EchoPlugin)
+    result, _ := echo.Invoke("hello")
+    fmt.Println(result) // hello
+    ```
+  </TabItem>
+</Tabs>
+
+## What's next
+
+**Concepts** — how the main components are wired:
+
+- [Plugin registry](./concepts/registry), [Manifest](./concepts/manifest), [Discovery](./concepts/discovery) — the base objects.
+- [Plugin kinds](./concepts/kinds), [Runtimes](./concepts/runtimes), [Dispatch](./concepts/dispatch) — architectural concepts.
+- [Resources (Resources DI)](./concepts/resources), [Runtime invariants](./concepts/invariants) — behaviour across environments.
+
+**Guides** — how to solve typical tasks:
+
+- [Writing a plugin](./guides/writing-a-plugin), [Configuration](./guides/configuration), [Lifecycle](./guides/lifecycle).
+- [Testing plugins](./guides/testing), [Dependencies](./guides/dependencies), [Dispatch classes](./guides/dispatchers/singleton).
+
+**Reference** — exact tables for quick lookup:
+
+- [`dagstack.toml` schema](./reference/manifest-schema), [Built-in kinds](./reference/kinds-list), [Runtime adapters](./reference/runtimes-list).
+- [Standard resources](./reference/resources-list), [Error taxonomy](./reference/errors).
+
+**Specification** — normative architecture decisions:
+
+- [Overview](./spec/overview), [ADR-0001: Core architecture](./spec/adr/0001-core), [ADR-0002: Hook invocation](./spec/adr/0002-hook-invocation), and the rest.
+
+**API reference** (generation deferred until the bindings reach stable):
+
+- [Python](./api/python), [TypeScript](./api/typescript) (roadmap), [Go](./api/go) (roadmap).

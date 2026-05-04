@@ -1,0 +1,154 @@
+---
+sidebar_position: 3
+title: Исполняющие среды
+description: Три runtime-адаптера — in_process / mcp_stdio / mcp_http. Полная таблица свойств, ограничений, runtime-specific полей манифеста.
+slug: /reference/runtimes-list
+---
+
+# Исполняющие среды — справочник
+
+В v1.0 spec-репозиторий нормативно фиксирует три runtime-адаптера. Каждый binding обязан реализовать все три.
+
+## Таблица свойств
+
+| Свойство | `in_process` | `mcp_stdio` | `mcp_http` |
+|---|---|---|---|
+| Где исполняется плагин | В том же процессе, что и host | В отдельном подпроцессе, связь через stdin/stdout | В отдельном хосте, связь через HTTP |
+| Cross-language | Только язык хоста | Любой язык (через MCP-протокол) | Любой язык |
+| Сериализация | Не требуется (native objects) | JSON (line-delimited) | JSON (HTTP body) |
+| Latency вызова | Наносекунды / микросекунды | Десятки микросекунд | Миллисекунды (сеть) |
+| Изоляция от host-процесса | Нет | Да (отдельный процесс) | Да (отдельный хост) |
+| Transient errors | Невозможны | Невозможны | Возможны (network, timeout) |
+| Deploy независим от host | Нет | Да (подпроцесс с отдельной версией) | Да |
+| Поддерживает streaming | Да (native iterator) | Ограниченно (line-delimited) | Ограниченно (SSE / WebSocket) |
+| Требует MCP-handshake | Нет | Да | Да |
+| Retry при падении вызова | Приложение само | Ядро может retry с backoff | Ядро может retry с backoff |
+| Подходит для hot-path с жёсткими требованиями к latency | Да | Нет (serialize + IPC) | Нет (serialize + network) |
+
+## `in_process`
+
+### Runtime-specific поля манифеста
+
+| Поле | Тип | Обязательное | Описание |
+|---|---|---|---|
+| `entry_point` | `string` | Да | `"module:ClassName"`. Модуль загружается через `importlib.util.spec_from_file_location` (для Python) или эквивалент. |
+
+### Пример
+
+```toml
+[plugin]
+runtime = "in_process"
+entry_point = "plugin:OpenAIPlugin"
+```
+
+### Контракт для кода плагина
+
+- Плагин — класс, реализующий протокол своего `kind` (получаемый из hookspec).
+- `setup(ctx)`, `teardown()` — обычные методы класса.
+- Runtime-инварианты 1–8 соблюдаются (см. [Инварианты runtime](../concepts/invariants)).
+- Runtime-инвариант 2 (сериализуемость) — рекомендуется, не обязателен (плагин может передавать native-объекты в пределах хоста).
+
+## `mcp_stdio`
+
+MCP = Model Context Protocol. JSON-RPC 2.0 поверх line-delimited JSON в stdin/stdout подпроцесса.
+
+### Runtime-specific поля манифеста
+
+| Поле | Тип | Обязательное | По умолчанию | Описание |
+|---|---|---|---|---|
+| `command` | `string[]` | Да | — | Команда запуска. Первый элемент — executable, остальные — аргументы. |
+| `working_dir` | `string` | Нет | cwd хоста | Рабочая директория подпроцесса. |
+| `env` | `object` | Нет | `{}` | Переменные окружения. Host подставляет в дополнение к своим. |
+| `startup_timeout_sec` | `int` | Нет | `30` | Таймаут initial MCP-рукопожатия. |
+
+### Пример
+
+```toml
+[plugin]
+runtime = "mcp_stdio"
+
+[plugin.mcp_stdio]
+command = ["python", "-m", "my_plugin.server"]
+startup_timeout_sec = 45
+env = { PYTHONUNBUFFERED = "1" }
+```
+
+### Контракт для кода плагина
+
+- Плагин — любой исполняемый файл, реализующий MCP-протокол: читает запросы из stdin, пишет ответы в stdout.
+- Инструментарий: `mcp-sdk` для Python / TypeScript / Go.
+- Все входы/выходы хуков обязаны быть **JSON-сериализуемы**.
+- Plugin может падать без ущерба host-процессу; host перезапускает подпроцесс при необходимости.
+
+## `mcp_http`
+
+JSON-RPC 2.0 поверх HTTP (POST с JSON-body).
+
+### Runtime-specific поля манифеста
+
+| Поле | Тип | Обязательное | По умолчанию | Описание |
+|---|---|---|---|---|
+| `url` | `string` | Да | — | Базовый URL MCP-сервиса (без trailing slash). |
+| `auth_header` | `string` | Нет | — | Имя HTTP-заголовка для Bearer-токена. |
+| `auth_secret_env` | `string` | Нет | — | Имя env-переменной, из которой host берёт значение секрета. |
+| `timeout_sec` | `int` | Нет | `60` | Таймаут на один HTTP-запрос. |
+| `tls_ca_bundle` | `string` | Нет | system CA | Путь к CA-bundle (для корпоративных self-signed сертификатов). |
+| `tls_verify` | `bool` | Нет | `true` | Проверка серверного сертификата. `false` **только** для dev — в production запрещено. |
+
+### Пример
+
+```toml
+[plugin]
+runtime = "mcp_http"
+
+[plugin.mcp_http]
+url = "https://plugins.example.com/tool/v1"
+auth_header = "X-API-Token"
+auth_secret_env = "EXAMPLE_API_TOKEN"
+timeout_sec = 120
+tls_ca_bundle = "/etc/ssl/certs/corp-ca.pem"
+```
+
+### Контракт для кода плагина
+
+- Плагин — HTTP-сервис, доступный по указанному URL и реализующий MCP.
+- Все требования `mcp_stdio` плюс свои: валидация сертификата, обработка network-ошибок, rate-limiting на стороне сервера.
+- Host ретраит transient-ошибки (5xx, connection reset) с exponential backoff.
+
+## Множественные runtimes в одном плагине
+
+Плагин может декларировать несколько runtime-адаптеров:
+
+```toml
+runtime = ["in_process", "mcp_stdio"]
+
+[plugin.mcp_stdio]
+command = ["python", "-m", "my_plugin.server"]
+```
+
+Host выбирает runtime при загрузке. Типичные сценарии:
+
+- **Python-host, Python-плагин** — выбирается `in_process` для производительности.
+- **TypeScript-host, Python-плагин** — выбирается `mcp_stdio` (TypeScript не умеет импортировать Python-модули).
+- **Разнорядный deploy** — выбирается `mcp_http`, если плагин уже развёрнут как SaaS.
+
+Если host не поддерживает ни один из указанных runtime-адаптеров, плагин помечается `RuntimeNotSupported`.
+
+## Выбор runtime-адаптера — flowchart
+
+```
+Плагин на том же языке, что и host?
+├── Да:
+│   ├── Нужна изоляция? ─── Нет, производительность важна ── in_process
+│   └─────────────────── Да, untrusted-код ──────────────── mcp_stdio
+└── Нет:
+    ├── Плагин — внешний сервис (SaaS, microservice) ────── mcp_http
+    └── Локальный плагин на другом языке ────────────────── mcp_stdio
+```
+
+## См. также
+
+- [Исполняющие среды](../concepts/runtimes) — концептуальный обзор.
+- [Манифест плагина](./manifest-schema) — полная схема манифеста.
+- [ADR-0001](../spec/adr/0001-core) — нормативный контракт runtime-адаптеров.
+- [ADR-0003: Orchestration-neutral runtime](../spec/adr/0003-runtime-invariants) — 8 инвариантов, обязательных во всех runtime-адаптерах.

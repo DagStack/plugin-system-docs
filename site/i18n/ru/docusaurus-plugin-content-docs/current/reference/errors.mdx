@@ -1,0 +1,337 @@
+---
+sidebar_position: 4
+title: Таксономия ошибок
+description: Полный перечень классов ошибок plugin-system — иерархия PluginRegistryError, когда каждая возникает, как обрабатывать.
+slug: /reference/errors
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Таксономия ошибок
+
+Все ошибки plugin-system наследуются от корневого класса `PluginRegistryError` (в Python; эквивалент в TS/Go реализациях). Иерархия зафиксирована нормативно в [ADR-0005 из plugin-system-spec](https://github.com/dagstack/plugin-system-spec/tree/main/adr) и одинакова во всех реализациях.
+
+## Иерархия
+
+```
+PluginRegistryError
+├── ManifestInvalid                # проблема с манифестом
+├── AmbiguousPlugin                # два плагина с одинаковой парой kind+name или priority
+├── VersionIncompatible            # core_version несовместим с установленным ядром
+├── KindUnknown                    # вид плагина не зарегистрирован
+├── RuntimeNotSupported            # runtime-адаптер недоступен
+├── DependencyCycle                # цикл в depends_on
+├── PluginLoadError                # ошибка при import/загрузке entry_point
+├── TeardownErrors                 # агрегированная ошибка teardowns
+├── LeakDetected                   # утечка ресурса после teardown (contract test)
+│
+├── Dispatch-related:
+│   ├── BroadcastErrors            # partial failure в broadcast_collect
+│   ├── DispatchMismatch           # плагин вернул не тот тип
+│   ├── NoCapabilityMatch          # capability-dispatch: нет подходящего плагина
+│
+└── Contract-related:
+    ├── AmbientStateError          # плагин нарушил инвариант 1
+    ├── SerializationError         # вход/выход не сериализуется (инвариант 2)
+    ├── DeterminismError           # детерминизм нарушен (инвариант 8)
+```
+
+## Ошибки этапа discovery / setup
+
+### `ManifestInvalid`
+
+Манифест не соответствует схеме.
+
+**Когда**: при `discover()` или `load_manifest()`. Отсутствует обязательное поле, неверный тип, неизвестное значение enum.
+
+**Поля ошибки**: `path` (путь к файлу манифеста), `field` (проблемное поле), `message` (описание).
+
+**Как обрабатывать**: починить манифест. Частые причины — `priority = "50"` (строка вместо числа), `runtime = "in-process"` (дефис вместо `in_process`), отсутствует `entry_point` для runtime `in_process`.
+
+### `AmbiguousPlugin`
+
+Два плагина с одинаковой парой `(kind, name)`, два `fallback = true` в одном виде, или неразрешимый ambiguity в singleton-dispatch.
+
+**Когда**: при `discover()` или `setup_all()`.
+
+**Поля ошибки**: `kind`, `name`, `conflicting_paths`.
+
+**Как обрабатывать**:
+
+- Duplicate `(kind, name)` — переименовать один из плагинов.
+- Два `fallback = true` — оставить ровно один, другой перевести на обычный `supports_*`.
+- Singleton ambiguity — различить `priority` или установить `DAGSTACK_ACTIVE_<KIND>=<plugin_name>`.
+
+### `VersionIncompatible`
+
+Плагин объявляет `core_version`, несовместимый с установленной версией `dagstack-plugin-system`.
+
+**Когда**: при `discover()`.
+
+**Поля ошибки**: `required_version` (semver range из манифеста), `installed_version`.
+
+**Как обрабатывать**: обновить плагин (если автор выпустил новую версию совместимую с вашим ядром) или обновить ядро.
+
+### `KindUnknown`
+
+Плагин декларирует `kind`, hookspec которого не зарегистрирован в реестре.
+
+**Когда**: при `discover()`.
+
+**Как обрабатывать**: добавить hookspec вида в параметр `kind_hookspecs` при вызове `discover()`, либо переименовать `kind` в манифесте плагина.
+
+### `RuntimeNotSupported`
+
+Плагин декларирует только runtime-адаптеры, которых host не поддерживает.
+
+**Когда**: при `discover()` или `setup()`.
+
+**Как обрабатывать**:
+
+- Для `mcp_http` — проверить, что host-конфигурация включает HTTP-адаптер.
+- Для `mcp_stdio` — проверить, что указанный `command` запускается и реализует MCP.
+- Если плагин декларирует только `in_process` и написан на другом языке — использовать `mcp_stdio` адаптер для cross-language вызова.
+
+### `DependencyCycle`
+
+Цикл в графе `depends_on`.
+
+**Когда**: при `setup_all()`.
+
+**Поля ошибки**: `cycle` — список плагинов, образующих цикл.
+
+**Как обрабатывать**: см. [Руководство: Зависимости](../guides/dependencies#циклы-зависимостей) — разорвать через общий младший плагин или lazy-lookup.
+
+### `PluginLoadError`
+
+Ошибка при import/загрузке модуля плагина (Python `ImportError`, TS `MODULE_NOT_FOUND`, Go fatal panic при динамической загрузке).
+
+**Когда**: при `discover()` после успешного парсинга манифеста.
+
+**Поля ошибки**: `plugin_name`, `cause` (оригинальное исключение).
+
+**Как обрабатывать**: проверить, что `entry_point` указывает на существующий файл, что в нём есть указанный класс, что импорты класса работают.
+
+## Ошибки dispatch
+
+### `BroadcastErrors`
+
+Один или несколько плагинов упали в `broadcast_collect` (с fail-fast-политикой).
+
+**Когда**: при вызове `BroadcastCollectDispatcher.collect()`.
+
+**Поля ошибки**: `failures: list[(plugin_name, exception)]`, `partial_results: list[any]`.
+
+**Как обрабатывать**: перейти на `error_policy: best_effort` в hookspec вида, если приложение устойчиво к partial результату; иначе — починить упавший плагин.
+
+### `DispatchMismatch`
+
+Плагин вернул значение не того типа, что ожидает следующий этап (в `chain`) или contract вида (в других классах диспетчеризации).
+
+**Когда**: во время вызова любого диспетчера.
+
+**Поля ошибки**: `expected_type`, `actual_type`, `plugin_name`, `hook`.
+
+**Как обрабатывать**: проверить, что output-schema предыдущего этапа совместим с input-schema следующего (`chain`) или что плагин возвращает ожидаемый тип.
+
+### `NoCapabilityMatch`
+
+В `capability-dispatch` нет ни одного плагина с подходящей capability и нет fallback-плагина.
+
+**Когда**: при `CapabilityDispatcher.dispatch()`.
+
+**Поля ошибки**: `input` (что не сматчилось), `available_plugins` (список плагинов вида).
+
+**Как обрабатывать**: добавить плагин с подходящим `supports_*`, либо добавить `fallback = true` у одного из существующих.
+
+## Ошибки контрактных тестов
+
+Бросаются только из `run_contract_suite` и `assert_*`-функций. В production-runtime не возникают (но нарушение инварианта может проявиться более тонкими багами — отсюда и обязательность contract-проверок).
+
+### `AmbientStateError`
+
+Плагин нарушил инвариант 1: использует внешнее состояние среды (event loop, module-mutable, `os.environ` в runtime).
+
+**Поля ошибки**: `violation_type`, `location` (имя файла/строка с нарушением).
+
+**Как обрабатывать**: см. [Инварианты runtime: §1](../concepts/invariants).
+
+### `SerializationError`
+
+Вход или выход хука не сериализуется в JSON (инвариант 2).
+
+**Поля ошибки**: `value_type`, `path` (например, `"output.data.client"`), `reason`.
+
+**Как обрабатывать**:
+
+- Живой объект (HTTP-клиент, файловый дескриптор) в output — возвращать данные, не ресурсы.
+- `datetime` — конвертировать в ISO-строку.
+- `Decimal`/`BigInt` — в строку.
+
+### `DeterminismError`
+
+Повторный запуск плагина с теми же входами и seeded/frozen-ресурсами даёт разный output (инвариант 8).
+
+**Поля ошибки**: `first_output`, `second_output`, `diff`.
+
+**Как обрабатывать**:
+
+- Проверить, что `time.time()` заменён на `ctx.clock.now()`.
+- `random()` заменён на `ctx.rng`.
+- Итерация по `set` — заменить на `sorted(set)`.
+- Итерация по `dict` — если Python 3.7+ OK; если старше или используется Go `map` — фиксированная сортировка ключей.
+
+### `LeakDetected`
+
+После `teardown()` остались незакрытые ресурсы (файловые дескрипторы, сетевые соединения, temp-файлы).
+
+**Поля ошибки**: `leaked_resources: list[(type, path_or_fd)]`.
+
+**Как обрабатывать**: добавить cleanup в `teardown()`.
+
+## `TeardownErrors`
+
+Агрегированная ошибка: при `teardown_all()` несколько плагинов выбросили исключение.
+
+**Когда**: при `teardown_all()` — только если было хотя бы одно падение.
+
+**Поля ошибки**: `errors: list[(plugin_name, exception)]`.
+
+**Как обрабатывать**: teardown-цикл не прерывается на одном падении, собирает все исключения. Приложение может обработать агрегированную ошибку (логирование), но процесс уже остановлен.
+
+## Пример обработки
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import (
+        PluginContext,
+        PluginRegistry,
+        ManifestInvalid,
+        AmbiguousPlugin,
+        VersionIncompatible,
+        KindUnknown,
+        DependencyCycle,
+        BroadcastErrors,
+        PluginRegistryError,
+    )
+
+    registry = PluginRegistry()
+    try:
+        registry.discover("plugins/")
+        await registry.setup_all(ctx)
+    except ManifestInvalid as exc:
+        # No structured fields — str(exc) carries the manifest path and the
+        # underlying validation reason.
+        ctx.logger.error("invalid manifest: %s", exc)
+        raise
+    except AmbiguousPlugin as exc:
+        ctx.logger.error("two plugins claim the same singleton kind: %s", exc)
+        raise
+    except VersionIncompatible as exc:
+        ctx.logger.error("plugin/core version mismatch: %s", exc)
+        raise
+    except KindUnknown as exc:
+        ctx.logger.error("kind has no registered plugins: %s", exc)
+        raise
+    except DependencyCycle as exc:
+        # The message includes at least one closed edge of the cycle.
+        ctx.logger.error("dependency cycle: %s", exc)
+        raise
+    except PluginRegistryError as exc:
+        # Catch-all for any other registry failure mode.
+        ctx.logger.error("plugin-system error: %s: %s", type(exc).__name__, exc)
+        raise
+
+    # broadcast_collect returns (results, errors|None) — it does NOT raise.
+    results, errors = dispatcher.dispatch("tool_provider", "list_tools", ctx)
+    if errors is not None:
+        for plugin_name, original in errors.errors:
+            ctx.logger.warning(
+                "plugin %s failed: %s: %s",
+                plugin_name, type(original).__name__, original,
+            )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "errors"
+        "log/slog"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    // Discover walks the filesystem and returns a slice of ManifestEntry; the
+    // host then constructs Plugin instances and calls Registry.RegisterManifest
+    // for each entry. SetupAll runs the topo-ordered setup loop afterwards.
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        switch {
+        case errors.Is(err, pluginsystem.ErrManifestInvalid):
+            slog.Error("invalid manifest", "err", err)
+        case errors.Is(err, pluginsystem.ErrPluginLoadError):
+            slog.Error("plugin load error", "err", err)
+        default:
+            slog.Error("plugin-system error", "err", err)
+        }
+        return err
+    }
+
+    reg := pluginsystem.NewRegistry()
+    // … register every entry against a constructed plugin instance …
+
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        switch {
+        case errors.Is(err, pluginsystem.ErrAmbiguousPlugin):
+            slog.Error("two plugins claim the same singleton kind", "err", err)
+        case errors.Is(err, pluginsystem.ErrVersionIncompatible):
+            slog.Error("plugin/core version mismatch", "err", err)
+        case errors.Is(err, pluginsystem.ErrKindUnknown):
+            slog.Error("kind has no registered plugins", "err", err)
+        case errors.Is(err, pluginsystem.ErrDependencyCycle):
+            // The error message includes at least one closed edge of the cycle.
+            slog.Error("dependency cycle", "err", err)
+        case errors.Is(err, pluginsystem.ErrPluginRegistry):
+            // Catch-all sentinel — every registry error wraps it.
+            slog.Error("plugin-system error", "err", err)
+        }
+        return err
+    }
+
+    // Broadcast-collect surfaces partial failures through the per-plugin
+    // CollectResult.Err field. The dispatcher itself does not return an error.
+    results := dispatcher.Dispatch(ctx, handler)
+    for _, r := range results {
+        if r.Err != nil {
+            slog.Warn("plugin failed", "plugin", r.PluginName, "err", r.Err)
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## См. также
+
+- [Реестр плагинов](../concepts/registry) — где каждая ошибка возникает в lifecycle.
+- [ADR-0002: Семантика вызова хуков](../spec/adr/0002-hook-invocation) — формальный контракт dispatch-ошибок.
+- [Инварианты runtime](../concepts/invariants) — какие инварианты какие ошибки порождают.
+- [Руководство: Тестирование плагинов](../guides/testing) — отладка contract-ошибок.

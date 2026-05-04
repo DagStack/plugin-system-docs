@@ -1,0 +1,74 @@
+{
+  "link.title.Documentation": {
+    "message": "Документация",
+    "description": "The title of the footer links column with title=Documentation in the footer"
+  },
+  "link.title.plugin-system": {
+    "message": "plugin-system",
+    "description": "The title of the footer links column with title=plugin-system in the footer"
+  },
+  "link.title.dagstack ecosystem": {
+    "message": "Экосистема dagstack",
+    "description": "The title of the footer links column with title=dagstack ecosystem in the footer"
+  },
+  "link.item.label.Quick start": {
+    "message": "Быстрый старт",
+    "description": "The label of footer link with label=Quick start linking to /docs/intro"
+  },
+  "link.item.label.Concepts": {
+    "message": "Понятия",
+    "description": "The label of footer link with label=Concepts linking to /docs/concepts/registry"
+  },
+  "link.item.label.Guides": {
+    "message": "Руководства",
+    "description": "The label of footer link with label=Guides linking to /docs/guides/writing-a-plugin"
+  },
+  "link.item.label.API reference": {
+    "message": "Справочник API",
+    "description": "The label of footer link with label=API reference linking to /docs/api/python"
+  },
+  "link.item.label.Specification (ADR overview)": {
+    "message": "Спецификация (обзор ADR)",
+    "description": "The label of footer link with label=Specification (ADR overview) linking to /docs/spec/overview"
+  },
+  "link.item.label.Full spec repository": {
+    "message": "Полный репозиторий спеки",
+    "description": "The label of footer link with label=Full spec repository linking to https://github.com/dagstack/plugin-system-spec"
+  },
+  "link.item.label.Python binding": {
+    "message": "Python-биндинг",
+    "description": "The label of footer link with label=Python binding linking to https://github.com/dagstack/plugin-system-python"
+  },
+  "link.item.label.TypeScript binding (roadmap)": {
+    "message": "TypeScript-биндинг (в плане)",
+    "description": "The label of footer link with label=TypeScript binding (roadmap) linking to https://github.com/dagstack/plugin-system-typescript"
+  },
+  "link.item.label.config — hierarchical configuration": {
+    "message": "config — иерархическая конфигурация",
+    "description": "The label of footer link with label=config — hierarchical configuration linking to https://github.com/dagstack/config-spec"
+  },
+  "link.item.label.logger — OTel-compatible logging": {
+    "message": "logger — OTel-совместимое логирование",
+    "description": "The label of footer link with label=logger — OTel-compatible logging linking to https://github.com/dagstack/logger-spec"
+  },
+  "link.item.label.tenancy — multi-tenancy model": {
+    "message": "tenancy — модель мультитенантности",
+    "description": "The label of footer link with label=tenancy — multi-tenancy model linking to https://github.com/dagstack/tenancy-spec"
+  },
+  "link.item.label.tenant-registry — SQL tenant registries": {
+    "message": "tenant-registry — SQL-реестры тенантов",
+    "description": "The label of footer link with label=tenant-registry — SQL tenant registries linking to https://github.com/dagstack/tenant-registry-spec"
+  },
+  "link.item.label.postgres — shared database patterns": {
+    "message": "postgres — общие паттерны работы с БД",
+    "description": "The label of footer link with label=postgres — shared database patterns linking to https://github.com/dagstack/postgres-spec"
+  },
+  "link.item.label.All repositories": {
+    "message": "Все репозитории",
+    "description": "The label of footer link with label=All repositories linking to https://github.com/dagstack"
+  },
+  "copyright": {
+    "message": "© 2026 dagstack. Лицензия Apache-2.0.",
+    "description": "The footer copyright"
+  }
+}

@@ -1,0 +1,281 @@
+---
+sidebar_position: 1
+title: Singleton
+description: End-to-end walkthrough for the singleton class — declare a kind, write a plugin, pick the active one, handle conflicts.
+slug: /guides/dispatchers/singleton
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Singleton — one active plugin per kind
+
+`singleton` is the simplest class: one active plugin handles every call to the kind. Used for kinds where "several active" makes no sense: one active payment provider per application, one vector store, one orchestrator, one LLM backend.
+
+## Step 1. Declare the kind
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```yaml title="kinds/payment_provider/v1.yaml"
+    kind: payment_provider
+    kind_api_version: 1.0.0
+    description: Payment provider — charge, refund, status check.
+
+    hooks:
+      - name: charge
+        dispatch: singleton
+        input_schema: schemas/charge.input.json
+        output_schema: schemas/charge.output.json
+        mcp_exposed: true
+      - name: refund
+        dispatch: singleton
+        input_schema: schemas/refund.input.json
+        output_schema: schemas/refund.output.json
+        mcp_exposed: true
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```yaml title="kinds/payment_provider/v1.yaml"
+    kind: payment_provider
+    kind_api_version: 1.0.0
+    description: Payment provider.
+
+    hooks:
+      - name: charge
+        dispatch: singleton
+        input_schema: schemas/charge.input.json
+        output_schema: schemas/charge.output.json
+        mcp_exposed: true
+    ```
+
+    The hookspec is the same across all implementations; different types are emitted.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```yaml title="kinds/payment_provider/v1.yaml"
+    kind: payment_provider
+    kind_api_version: 1.0.0
+    description: Payment provider.
+
+    hooks:
+      - name: charge
+        dispatch: singleton
+        input_schema: schemas/charge.input.json
+        output_schema: schemas/charge.output.json
+        mcp_exposed: true
+    ```
+  </TabItem>
+</Tabs>
+
+## Step 2. Write two implementations
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```toml title="plugins/payment_provider/stripe/dagstack.toml"
+    [plugin]
+    name = "stripe"
+    kind = "payment_provider"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 50
+    ```
+
+    ```python title="plugins/payment_provider/stripe/plugin.py"
+    class StripeProvider:
+        async def setup(self, ctx):
+            self._http = ctx.registry.resource_registry.get("http_client")
+            self._config = ctx.config
+
+        async def charge(self, input):
+            response = await self._http.post(
+                "https://api.stripe.com/v1/charges",
+                headers={"Authorization": f"Bearer {self._config['api_key']}"},
+                json={"amount": input.amount_cents, "currency": input.currency, "source": input.source},
+            )
+            return {"transaction_id": response.json()["id"], "status": "succeeded"}
+    ```
+
+    ```toml title="plugins/payment_provider/internal/dagstack.toml"
+    [plugin]
+    name = "internal"
+    kind = "payment_provider"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 40
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```json title="plugins/payment_provider/stripe/dagstack.json"
+    {
+      "plugin": {
+        "name": "stripe",
+        "kind": "payment_provider",
+        "runtime": "in_process",
+        "core_version": "^0.2",
+        "priority": 50
+      }
+    }
+    ```
+
+    ```ts title="plugins/payment_provider/stripe/plugin.ts"
+    export class StripeProvider {
+      async charge(input: ChargeInput): Promise<ChargeOutput> {
+        // ...
+      }
+    }
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```toml title="plugins/payment_provider/stripe/dagstack.toml"
+    [plugin]
+    name = "stripe"
+    kind = "payment_provider"
+    runtime = "in_process"
+    core_version = ">=0.1.0,<1.0.0"
+    priority = 50
+    ```
+
+    ```go title="plugins/payment_provider/stripe/plugin.go"
+    package stripe
+
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type StripeProvider struct{}
+
+    func (p *StripeProvider) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        return nil
+    }
+
+    func (p *StripeProvider) Charge(ctx context.Context, input ChargeInput) (ChargeOutput, error) {
+        // ...
+        return ChargeOutput{}, nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+The registry now holds two plugins of the kind `payment_provider` at different priorities.
+
+## Step 3. Picking the active plugin
+
+Per [ADR-0002](../../spec/adr/0002-hook-invocation) §1, the algorithm is:
+
+1. **Application routing policy** (when supplied) — for example, per-tenant selection: premium tenants use Stripe, internal tenants use the internal provider.
+2. **Env override** — `DAGSTACK_ACTIVE_PAYMENT_PROVIDER=internal`.
+3. **Priority** — the plugin with `priority=50` (`stripe`) wins over `priority=40` (`internal`).
+4. **Ambiguity** — if both had `priority=50`, the core raises `AmbiguousPlugin` at startup.
+
+## Step 4. The call
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    payment = registry.get_plugin("payment_provider")
+    result = await payment.charge(ChargeInput(amount_cents=1999, currency="USD", source="tok_visa"))
+    print(result.transaction_id)
+    ```
+
+    Picking a specific plugin explicitly (when needed):
+
+    ```python
+    payment = registry.get_plugin("payment_provider", name="internal")
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const payment = new SingletonDispatcher<ChargeInput, ChargeOutput>("payment_provider");
+    const result = await payment.dispatch(
+      registry.getLoadedPlugins(),
+      "charge",
+      { amountCents: 1999, currency: "USD", source: "tok_visa" },
+    );
+    console.log(result.transactionId);
+    ```
+
+    Picking a specific plugin explicitly (when needed) — bypass selection by going through the registry directly:
+
+    ```ts
+    const internal = registry.getPlugin("payment_provider", "internal");
+    // ... or attach the loaded instance and call its hook
+    const loaded = registry.getLoadedPlugins().find((p) => p.manifest.name === "internal");
+    const directResult = await (loaded?.instance as { charge: (i: ChargeInput) => Promise<ChargeOutput> })
+      .charge({ amountCents: 1999, currency: "USD", source: "tok_visa" });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    disp := pluginsystem.NewDispatchSingleton[PaymentProvider](reg, "payment_provider")
+    payment, err := disp.Resolve()
+    if err != nil {
+        return err
+    }
+    resp, err := payment.Charge(context.Background(), ChargeInput{
+        AmountCents: 1999,
+        Currency:    "USD",
+        Source:      "tok_visa",
+    })
+    ```
+
+    `NewDispatchSingleton[T]` is generic — `T` is the kind contract you cast plugin instances to. The dispatcher applies the same selection algorithm as the spec (priority + env override + ambiguity check).
+
+    Picking a specific plugin explicitly (when needed):
+
+    ```go
+    plugin, err := reg.ResolveSingleton("payment_provider")
+    // plugin.Unwrap() returns the bound instance; cast to the kind contract.
+    payment := plugin.Unwrap().(PaymentProvider)
+    ```
+  </TabItem>
+</Tabs>
+
+## Switching the active plugin
+
+**Via an env var** — no restart required:
+
+```bash
+export DAGSTACK_ACTIVE_PAYMENT_PROVIDER=internal
+python main.py
+```
+
+**Via a routing policy** — at runtime, per-tenant:
+
+:::info Phase 2 scope
+Per-call routing policies (`set_routing_policy(kind, policy=...)`) are part of the Phase 2 roadmap. In `0.1.0-rc.2` selection follows priority + env override + explicit `name=` only. For tenant-driven routing today, resolve the active provider in application code with `registry.get_plugin("payment_provider", name=...)`.
+:::
+
+## Common errors
+
+| Symptom | Cause |
+|---|---|
+| `AmbiguousPlugin: equal priority for kind=payment_provider` at startup | Two plugins of the kind have equal `priority` and there is no env override. Differentiate the priorities or set `DAGSTACK_ACTIVE_PAYMENT_PROVIDER=...`. |
+| `KindUnknown: payment_provider` | The kind's hookspec is not registered; call `registry.add_hookspecs(...)` for the kind module before `registry.discover("plugins/")`. |
+| `RuntimeNotSupported` | The plugin only declared `runtime = "mcp_http"`, and the host adapter is not configured. |
+
+## Singleton for other domains — the same pattern
+
+The same walkthrough applies to any kind that needs "one active":
+
+- `llm` — one LLM backend per application (OpenAI / Anthropic / local).
+- `vector_store` — one vector store (Qdrant / pgvector).
+- `orchestrator` — one UoW orchestrator per runtime.
+- `cache` — one cache backend (Redis / memcached).
+- `auth_provider` — one primary auth (OAuth / SAML).
+
+The mechanics are the same: declare the hookspec, two-plus implementations, pick by priority / env override / routing policy.
+
+## See also
+
+- [Dispatch](../../concepts/dispatch) — overview of all five classes.
+- [ADR-0002 §1 singleton](../../spec/adr/0002-hook-invocation) — the normative selection algorithm.
+- [Broadcast-collect](./broadcast-collect) — when you need every implementation at once.

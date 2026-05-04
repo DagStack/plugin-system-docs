@@ -1,0 +1,239 @@
+---
+sidebar_position: 3
+title: Plugin discovery
+description: The discover(path) function — recursive directory walk, dagstack.toml discovery rules, exclusions, and limitations.
+slug: /concepts/discovery
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Plugin discovery
+
+Discovery is the process by which the registry locates plugins on the file system. The implementation rests on the file-based model declared in [ADR-0006](https://github.com/dagstack/plugin-system-spec/tree/main/adr/0006-file-based-plugin-discovery.md): a plugin is **a folder with a `dagstack.toml`**. Everything else is an implementation detail.
+
+## Directory layout
+
+```
+my-app/
+├── plugins/
+│   ├── openai/
+│   │   ├── dagstack.toml
+│   │   └── plugin.py
+│   ├── qdrant/
+│   │   ├── dagstack.toml
+│   │   └── plugin.py
+│   └── echo/
+│       ├── dagstack.toml
+│       └── plugin.py
+└── main.py
+```
+
+Every folder containing a `dagstack.toml` becomes one plugin. Nested plugin folders are **not** supported — a plugin cannot live inside another plugin.
+
+## Calling discovery
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+
+    async def main() -> None:
+        registry = PluginRegistry()
+        registry.discover("plugins/")
+
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("app"),
+            registry=registry,
+        )
+        await registry.setup_all(ctx)
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    const result = await discover(registry, "plugins/");
+    if (result.failures.length > 0) {
+      console.error("Discovery failures:", result.failures);
+    }
+    await registry.setupAll();
+    ```
+
+    The TypeScript binding accepts both `dagstack.json` (canonical for the JS ecosystem) and `dagstack.toml` manifests; auto-unwrap of the `[plugin]` section keeps cross-binding parity with Python. Multi-root discovery and `override` flows land in Phase 2 — for now, run `discover()` once per registry against a single root directory.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    ctx := context.Background()
+
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        return err
+    }
+
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        if err := reg.RegisterManifest(entry.Manifest, buildPlugin(entry.Manifest)); err != nil {
+            return err
+        }
+    }
+
+    pluginCtx := &pluginsystem.PluginContext{
+        Logger:   slog.Default(),
+        Registry: reg,
+    }
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        return err
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Relative paths are resolved against the process's current working directory. In production we recommend passing an absolute path or a path relative to a known application root.
+
+## Discovery rules
+
+1. The walk is **recursive** from the given folder downwards. Depth is unlimited.
+2. Every folder is checked for `dagstack.toml`. If the file is present, the folder becomes a plugin and its contents are not scanned further (nested plugins are forbidden).
+3. Folders without `dagstack.toml` are traversed transparently. This lets you group plugins into thematic subfolders (`plugins/data-sources/`, `plugins/llm/`).
+4. Plugins sharing the same `kind+name` pair raise `AmbiguousPlugin`. The name must be unique within a kind.
+
+## Ignored paths
+
+By default discovery skips system and housekeeping folders:
+
+```
+__pycache__/
+node_modules/
+.git/
+.venv/
+venv/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.tox/
+dist/
+build/
+```
+
+The full list lives in the `DEFAULT_IGNORE` constant. To add your own rules pass the `ignore` parameter:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import PluginRegistry
+    from dagstack.plugin_system import DEFAULT_IGNORE
+
+    registry = PluginRegistry()
+    registry.discover(
+        "plugins/",
+        ignore=[*DEFAULT_IGNORE, "experimental/*", "*.draft"],
+    )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    const result = await discover(registry, "plugins/");
+    if (result.failures.length > 0) {
+      console.error("Discovery failures:", result.failures);
+    }
+    await registry.setupAll();
+    ```
+
+    The TypeScript binding accepts both `dagstack.json` (canonical for the JS ecosystem) and `dagstack.toml` manifests; auto-unwrap of the `[plugin]` section keeps cross-binding parity with Python. Multi-root discovery and `override` flows land in Phase 2 — for now, run `discover()` once per registry against a single root directory.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    entries, err := pluginsystem.Discover("plugins/",
+        pluginsystem.WithExclude(append(pluginsystem.DefaultIgnoreDirs, "experimental", "drafts")...),
+    )
+    ```
+  </TabItem>
+</Tabs>
+
+Patterns support glob syntax (`*`, `**`, `?`).
+
+## Discovering multiple roots
+
+If the application combines plugins from several independent folders (for example, core plugins next to `main.py` and user plugins in `~/.config/my-app/plugins/`), run `discover` against each root and merge the results:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    :::warning `merge` is planned for Phase 2
+    Today the Python binding accepts a single discovery root per `PluginRegistry`. Combining several roots — and the matching `merge` / `override` semantics described below — is planned for Phase 2. For now, lay your plugins out under one discovery root and call `registry.discover("plugins/")` once.
+    :::
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    const result = await discover(registry, "plugins/");
+    if (result.failures.length > 0) {
+      console.error("Discovery failures:", result.failures);
+    }
+    await registry.setupAll();
+    ```
+
+    The TypeScript binding accepts both `dagstack.json` (canonical for the JS ecosystem) and `dagstack.toml` manifests; auto-unwrap of the `[plugin]` section keeps cross-binding parity with Python. Multi-root discovery and `override` flows land in Phase 2 — for now, run `discover()` once per registry against a single root directory.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::warning Multi-root merge is planned for Phase 2
+    `go.dagstack.dev/plugin-system v0.1.0-rc.1` exposes a single `Discover()` per root and a single `NewRegistry()` per process. Multi-root merge with conflict-aware `kind+name` resolution lands together with the Python `merge` API in Phase 2. For now, call `Discover()` against several roots in sequence and `RegisterManifest()` each entry into one registry — duplicates surface as `ErrAmbiguousPlugin` from `RegisterManifest`.
+    :::
+  </TabItem>
+</Tabs>
+
+When `merge` ships in Phase 2, conflicts at the `kind+name` level surface as `AmbiguousPlugin`. For the "user overrides a system plugin" case the explicit `override` mechanism (described below) is the planned path.
+
+## Overriding plugins (Phase 2)
+
+Sometimes you need to swap a plugin out for testing or local development. The Phase 2 release will add an explicit `override` flow that takes a second registry and lets entries from it replace those of the first without raising `AmbiguousPlugin`. Until then, point a separate `PluginRegistry()` at the fixture folder and use it directly in the test:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    :::warning `override` is planned for Phase 2
+    Today the Python binding does not provide an explicit override flow — discovery is single-rooted. To swap a plugin out for tests, point a test-only registry at a fixture folder (`registry.discover("tests/fixtures/plugins/")`) and use it directly. The conflict-aware `override` API lands together with `merge` in Phase 2.
+    :::
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    const result = await discover(registry, "plugins/");
+    if (result.failures.length > 0) {
+      console.error("Discovery failures:", result.failures);
+    }
+    await registry.setupAll();
+    ```
+
+    The TypeScript binding accepts both `dagstack.json` (canonical for the JS ecosystem) and `dagstack.toml` manifests; auto-unwrap of the `[plugin]` section keeps cross-binding parity with Python. Multi-root discovery and `override` flows land in Phase 2 — for now, run `discover()` once per registry against a single root directory.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    :::warning Override is planned for Phase 2
+    `go.dagstack.dev/plugin-system v0.1.0-rc.1` does not yet provide an explicit override flow. To swap a plugin out for tests, point a separate `pluginsystem.NewRegistry()` at a fixture root (`Discover("tests/fixtures/plugins/")`) and use it directly in the test. The conflict-aware `Override` helper lands together with `Merge` in Phase 2.
+    :::
+  </TabItem>
+</Tabs>
+
+When `override` ships, conflicts will not be treated as errors — entries from the second registry replace entries from the first.
+
+## Performance
+
+For large directories (≥1000 plugins) the walk takes noticeable time. Recommendations:
+
+- Run `discover` once at application start-up and cache the result.
+- Use `ignore` to skip folders known to contain no plugins (tests, docs).
+- If the plugins are known up front, pass an explicit list of paths instead of a recursive walk.

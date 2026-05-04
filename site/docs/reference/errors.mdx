@@ -1,0 +1,321 @@
+---
+sidebar_position: 4
+title: Error taxonomy
+description: Full list of plugin-system error classes — the PluginRegistryError hierarchy, when each one is raised, and how to handle it.
+slug: /reference/errors
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Error taxonomy
+
+Every plugin-system error inherits from the root class `PluginRegistryError` (in Python; equivalents exist in the TS/Go bindings). The taxonomy follows the contracts in [ADR-0001 (plugin architecture core)](../spec/adr/0001-core) for registration / lifecycle errors and [ADR-0002 (hook invocation semantics)](../spec/adr/0002-hook-invocation) for dispatch errors, and is kept in lockstep across bindings.
+
+## Hierarchy
+
+```
+PluginRegistryError
+├── ManifestInvalid                # problem with the manifest
+├── AmbiguousPlugin                # two plugins satisfy the same singleton kind
+├── VersionIncompatible            # core_version is incompatible with the installed core
+├── KindUnknown                    # no plugin registered for the requested kind
+├── RuntimeNotSupported            # the runtime adapter is unavailable in this phase
+├── DependencyCycle                # cycle in depends_on
+├── PluginLoadError                # error while importing/loading the entry_point
+├── TeardownErrors                 # aggregated teardown errors
+├── LeakDetected                   # resource leak after teardown (contract test)
+│
+└── Dispatch-related:
+    ├── BroadcastErrors            # aggregate of partial failures in broadcast_collect
+    ├── DispatchMismatch           # dispatcher class does not match the hook's dispatch class
+    └── NoCapabilityMatch          # capability dispatch: no matching plugin and no fallback
+```
+
+:::info Plain exceptions, no structured fields in 0.1.x
+
+In `dagstack-plugin-system 0.1.0-rc.2` (Python) every error in the hierarchy is a plain `Exception` subclass — none carry structured attributes (`exc.path`, `exc.kind`, `exc.cycle`, …). Match by **class** and read context from `str(exc)`. Structured fields are a candidate addition for a future minor release; until then, the message string is the single source of context.
+
+:::
+
+:::info Sentinel errors only in `go.dagstack.dev/plugin-system 0.1.x`
+
+The Go binding ships **package-level sentinel errors** (`pluginsystem.ErrManifestInvalid`, `pluginsystem.ErrAmbiguousPlugin`, `pluginsystem.ErrDependencyCycle`, …) that wrap a base `pluginsystem.ErrPluginRegistry`. Match them with `errors.Is(err, pluginsystem.ErrXxx)`; structured types with field accessors (`.Path`, `.Kind`, `.Cycle`) are a Phase 2 addition. Every wrapped error carries the human-readable context inside its `Error()` string. The single struct error type that does ship today is `*PluginInvocationError`, which pairs a plugin name with its underlying error inside `BroadcastErrors` / `TeardownErrors` aggregates.
+
+:::
+
+## Discovery / setup-stage errors
+
+### `ManifestInvalid`
+
+The manifest does not match the schema.
+
+**When**: during `discover()` or `load_manifest()`. A required field is missing, a type is wrong, or an enum value is unknown.
+
+**What `str(exc)` carries**: which manifest path failed to parse and the underlying validation reason.
+
+**How to handle**: fix the manifest. Common causes — `priority = "50"` (string instead of number), `runtime = "in-process"` (hyphen instead of `in_process`), missing `entry_point` for the `in_process` runtime.
+
+### `AmbiguousPlugin`
+
+Two plugins share the same `(kind, name)` pair, two plugins declare `fallback = true` for the same kind, or singleton dispatch sees an unresolvable ambiguity.
+
+**When**: during `discover()` or `setup_all(ctx)`.
+
+**What `str(exc)` carries**: the kind and the names of the conflicting plugins.
+
+**How to handle**:
+
+- Duplicate `(kind, name)` — rename one of the plugins.
+- Two `fallback = true` — keep exactly one and switch the other to a regular `supports_*`.
+- Singleton ambiguity — distinguish them via `priority` or set `DAGSTACK_ACTIVE_<KIND>=<plugin_name>`.
+
+### `VersionIncompatible`
+
+The plugin declares a `core_version` that is incompatible with the installed `dagstack-plugin-system` version.
+
+**When**: during `discover()`.
+
+**What `str(exc)` carries**: the required semver range and the installed core version.
+
+**How to handle**: upgrade the plugin (if the author has shipped a new version compatible with your core) or upgrade the core itself.
+
+### `KindUnknown`
+
+The requested kind has no plugins registered for it.
+
+**When**: on `registry.get_plugin(kind, ...)` for a kind that no manifest declared.
+
+**What `str(exc)` carries**: the kind name.
+
+**How to handle**: register a plugin of that kind, or fix the kind name on the call site.
+
+### `RuntimeNotSupported`
+
+The plugin declares only runtime adapters that the host does not support (in Phase 0 only `in_process` is supported; `mcp_stdio` and `mcp_http` raise this error).
+
+**When**: during `discover()` or `setup()`.
+
+**How to handle**:
+
+- Today: deliver every plugin through the `in_process` runtime.
+- `mcp_stdio` / `mcp_http` adapters land in Phase 1+.
+
+### `DependencyCycle`
+
+There is a cycle in the `depends_on` graph.
+
+**When**: during `setup_all(ctx)`.
+
+**What `str(exc)` carries**: at least one closed edge in the cycle, so plugin authors know which dependency to start untangling.
+
+**How to handle**: see [Guide: Dependencies](../guides/dependencies#dependency-cycles) — break the cycle through a shared lower-level plugin or use a lazy lookup.
+
+### `PluginLoadError`
+
+Error while importing/loading the plugin module (Python `ImportError`, TS `MODULE_NOT_FOUND`, Go fatal panic during dynamic loading).
+
+**When**: during `discover()`, after the manifest has been parsed successfully.
+
+**What `str(exc)` carries**: the plugin name and the original exception text.
+
+**How to handle**: verify that `entry_point` points to an existing file, that the file contains the named class, and that the class's imports work.
+
+## Dispatch errors
+
+### `BroadcastErrors`
+
+One or more plugins failed inside `broadcast_collect` (continue-on-failure aggregate).
+
+**When**: as the second element of the `(results, errors)` tuple returned by `BroadcastCollectDispatcher.dispatch(...)`. The dispatcher does **not** raise on partial failure; it returns the tuple. The exception class is kept in the hierarchy so callers MAY explicitly raise it when a partial result is unacceptable.
+
+**Attributes**: `errors: list[tuple[str, BaseException]]` — `(plugin_name, exception)` pairs. This is the only structured field that the hierarchy exposes today (the constructor stores the list).
+
+**How to handle**: iterate `errors.errors` and decide per call whether the partial result is acceptable. For a hard fail, `raise errors`.
+
+### `DispatchMismatch`
+
+Programmer error: a dispatcher was invoked for a hook whose declared dispatch class differs from the dispatcher's class (for example, calling a `singleton` hook through `BroadcastCollectDispatcher`).
+
+**When**: during a call through any dispatcher.
+
+**How to handle**: pick the dispatcher that matches the hookspec's `dispatch_class`, or fix the hookspec.
+
+### `NoCapabilityMatch`
+
+In `capability` dispatch, no plugin's `matches(input) -> bool` returned `True`, and no plugin is declared as the fallback.
+
+**When**: during `CapabilityDispatcher.dispatch(...)`.
+
+**How to handle**: add a plugin with a matching `supports_*`, or set `fallback = true` on one of the existing plugins.
+
+## Contract-test errors
+
+`LeakDetected` is the contract-suite-only error in the hierarchy today (`AmbientStateError`, `SerializationError`, `DeterminismError` are reserved names that will land with the full contract suite in Phase 1+; in `0.1.0-rc.2` an invariant violation surfaces as a generic `AssertionError` from the test helper).
+
+### `LeakDetected`
+
+After `teardown()` the contract test detected a resource leak (file descriptors, network connections, temp files).
+
+**When**: from `assert_lifecycle_clean` inside `run_contract_suite`.
+
+**How to handle**: add the missing cleanup to `teardown()`.
+
+## `TeardownErrors`
+
+Aggregated error: several plugins raised during `teardown_all(ctx)`.
+
+**When**: at the end of `teardown_all(ctx)` — only if at least one teardown failed.
+
+**Attributes**: `errors: list[BaseException]` — every caught exception, in the order they were raised during reverse-setup teardown.
+
+**How to handle**: the teardown loop does not stop on a single failure; it collects every exception. The application can log the aggregate, but the process is already shutting down.
+
+## Handling example
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import (
+        PluginContext,
+        PluginRegistry,
+        ManifestInvalid,
+        AmbiguousPlugin,
+        VersionIncompatible,
+        KindUnknown,
+        DependencyCycle,
+        BroadcastErrors,
+        PluginRegistryError,
+    )
+
+    registry = PluginRegistry()
+    try:
+        registry.discover("plugins/")
+        await registry.setup_all(ctx)
+    except ManifestInvalid as exc:
+        # No structured fields — str(exc) carries the manifest path and the
+        # underlying validation reason.
+        ctx.logger.error("invalid manifest: %s", exc)
+        raise
+    except AmbiguousPlugin as exc:
+        ctx.logger.error("two plugins claim the same singleton kind: %s", exc)
+        raise
+    except VersionIncompatible as exc:
+        ctx.logger.error("plugin/core version mismatch: %s", exc)
+        raise
+    except KindUnknown as exc:
+        ctx.logger.error("kind has no registered plugins: %s", exc)
+        raise
+    except DependencyCycle as exc:
+        # The message includes at least one closed edge of the cycle.
+        ctx.logger.error("dependency cycle: %s", exc)
+        raise
+    except PluginRegistryError as exc:
+        # Catch-all for any other registry failure mode.
+        ctx.logger.error("plugin-system error: %s: %s", type(exc).__name__, exc)
+        raise
+
+    # broadcast_collect returns (results, errors|None) — it does NOT raise.
+    results, errors = dispatcher.dispatch("tool_provider", "list_tools", ctx)
+    if errors is not None:
+        for plugin_name, original in errors.errors:
+            ctx.logger.warning(
+                "plugin %s failed: %s: %s",
+                plugin_name, type(original).__name__, original,
+            )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import {
+      AmbiguousPlugin,
+      KindUnknown,
+      ManifestInvalid,
+      VersionIncompatible,
+      PluginLoadError,
+      DependencyCycle,
+      MissingDependency,
+      TeardownErrors,
+      isAmbiguousPlugin,
+      isVersionIncompatible,
+    } from "@dagstack/plugin-system";
+
+    try {
+      await registry.setupAll({ resources });
+    } catch (err) {
+      if (isAmbiguousPlugin(err)) {
+        console.error(`Ambiguous plugins for kind=${err.kind}:`, err.candidates);
+      } else if (isVersionIncompatible(err)) {
+        console.error(`Plugin ${err.pluginName} requires ${err.requiredCoreRange}`);
+      } else {
+        throw err;
+      }
+    }
+    ```
+
+    Each error class exposes a stable `code` field and a matching `is<Name>(err)` type guard — mirrors Go's `errors.Is(err, ErrAmbiguousPlugin)` pattern, cross-realm-safe via `Symbol.for`.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "errors"
+        "log/slog"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    // Discover walks the filesystem and returns a slice of ManifestEntry; the
+    // host then constructs Plugin instances and calls Registry.RegisterManifest
+    // for each entry. SetupAll runs the topo-ordered setup loop afterwards.
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        switch {
+        case errors.Is(err, pluginsystem.ErrManifestInvalid):
+            slog.Error("invalid manifest", "err", err)
+        case errors.Is(err, pluginsystem.ErrPluginLoadError):
+            slog.Error("plugin load error", "err", err)
+        default:
+            slog.Error("plugin-system error", "err", err)
+        }
+        return err
+    }
+
+    reg := pluginsystem.NewRegistry()
+    // … register every entry against a constructed plugin instance …
+
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        switch {
+        case errors.Is(err, pluginsystem.ErrAmbiguousPlugin):
+            slog.Error("two plugins claim the same singleton kind", "err", err)
+        case errors.Is(err, pluginsystem.ErrVersionIncompatible):
+            slog.Error("plugin/core version mismatch", "err", err)
+        case errors.Is(err, pluginsystem.ErrKindUnknown):
+            slog.Error("kind has no registered plugins", "err", err)
+        case errors.Is(err, pluginsystem.ErrDependencyCycle):
+            // The error message includes at least one closed edge of the cycle.
+            slog.Error("dependency cycle", "err", err)
+        case errors.Is(err, pluginsystem.ErrPluginRegistry):
+            // Catch-all sentinel — every registry error wraps it.
+            slog.Error("plugin-system error", "err", err)
+        }
+        return err
+    }
+
+    // Broadcast-collect surfaces partial failures through the per-plugin
+    // CollectResult.Err field. The dispatcher itself does not return an error.
+    results := dispatcher.Dispatch(ctx, handler)
+    for _, r := range results {
+        if r.Err != nil {
+            slog.Warn("plugin failed", "plugin", r.PluginName, "err", r.Err)
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## See also
+
+- [Plugin registry](../concepts/registry) — where each error is raised in the lifecycle.
+- [ADR-0002: Hook invocation semantics](../spec/adr/0002-hook-invocation) — formal contract for dispatch errors.
+- [Runtime invariants](../concepts/invariants) — which invariants give rise to which errors.
+- [Guide: Testing plugins](../guides/testing) — debugging contract errors.

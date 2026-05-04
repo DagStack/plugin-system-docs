@@ -1,0 +1,231 @@
+---
+sidebar_position: 2
+title: Plugin configuration
+description: How a plugin receives its settings via dagstack/config-spec — declaring a section, reading it in setup, validating with a pydantic schema.
+slug: /guides/configuration
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Plugin configuration
+
+Plugins receive their settings through the unified `dagstack/config-spec` mechanism. The application configuration is a hierarchical YAML file with layers (`app-config.yaml` → `app-config.local.yaml` → `app-config.${DAGSTACK_ENV}.yaml`). Each plugin declares its own section and receives the contents inside `setup`.
+
+## Plugin section in the config
+
+The section name is `<kind>.<name>`. For a `stripe` plugin of kind `payment_provider` the section is `payment_provider.stripe`:
+
+```yaml title="app-config.yaml"
+payment_provider:
+  stripe:
+    base_url: "${STRIPE_BASE_URL:-https://api.stripe.com/v1}"
+    api_key: "${STRIPE_API_KEY}"
+    webhook_secret: "${STRIPE_WEBHOOK_SECRET}"
+    timeout_s: 30
+    max_retries: 3
+```
+
+The substitutions `${VAR:-default}` and `${VAR}` are applied automatically when the configuration is loaded.
+
+## Schema declaration
+
+A plugin declares a pydantic schema for its section. The registry runs the schema for validation before passing the config into `setup`. An invalid configuration raises `ManifestInvalid` (or its equivalent in other languages) with the offending field highlighted.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugins/payment_provider/stripe/plugin.py"
+    from pydantic import BaseModel, Field
+    from dagstack.plugin_system import PluginContext
+
+
+    class StripeConfig(BaseModel):
+        base_url: str = "https://api.stripe.com/v1"
+        api_key: str = Field(..., min_length=1)
+        webhook_secret: str = Field(..., min_length=1)
+        timeout_s: float = 30.0
+        max_retries: int = 3
+
+
+    class StripeProvider:
+        config_schema = StripeConfig
+
+        async def setup(self, context: PluginContext) -> None:
+            config = StripeConfig(**context.config)  # already validated
+            self._client = build_client(
+                base_url=config.base_url,
+                api_key=config.api_key,
+                timeout=config.timeout_s,
+            )
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { z } from "zod";
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    const ConfigSchema = z.object({
+      api_url: z.string().url(),
+      timeout_ms: z.number().int().positive().default(30_000),
+      retries: z.number().int().min(0).default(3),
+    });
+    type Config = z.infer<typeof ConfigSchema>;
+
+    export class MyPlugin {
+      private config!: Config;
+
+      async setup(ctx: PluginContext): Promise<void> {
+        this.config = ConfigSchema.parse(ctx.config);
+      }
+    }
+
+    // Host passes per-plugin config into setupAll:
+    //   await registry.setupAll({
+    //     configs: { "my-plugin": { api_url: "https://api.example.com" } },
+    //     resources,
+    //   });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugins/payment_provider/stripe/plugin.go"
+    package stripe
+
+    import (
+        "context"
+        "encoding/json"
+        "errors"
+        "net/http"
+        "time"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type Config struct {
+        BaseURL       string  `json:"base_url"`
+        APIKey        string  `json:"api_key"`
+        WebhookSecret string  `json:"webhook_secret"`
+        TimeoutS      float64 `json:"timeout_s"`
+        MaxRetries    int     `json:"max_retries"`
+    }
+
+    type StripeProvider struct {
+        cfg    Config
+        client *http.Client
+    }
+
+    func (p *StripeProvider) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        // PluginContext.Config is map[string]any — round-trip through JSON to decode.
+        raw, err := json.Marshal(pluginCtx.Config)
+        if err != nil {
+            return err
+        }
+        cfg := Config{
+            BaseURL:    "https://api.stripe.com/v1",
+            TimeoutS:   30,
+            MaxRetries: 3,
+        }
+        if err := json.Unmarshal(raw, &cfg); err != nil {
+            return err
+        }
+        if cfg.APIKey == "" {
+            return errors.New("payment_provider.stripe.api_key is required")
+        }
+        p.cfg = cfg
+        p.client = &http.Client{Timeout: time.Duration(cfg.TimeoutS * float64(time.Second))}
+        return nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Sensitive fields and secrets
+
+Fields that hold secrets (API keys, passwords, tokens) must be masked in logs. `dagstack/config-spec` keeps a list of field names that are treated as secrets by default:
+
+- `api_key`, `secret_key`, `access_token`, `password`, `client_secret`
+- any field whose name ends with `_secret`, `_token`, `_password`, `_key`
+
+When the configuration is printed (for example, in startup diagnostics) the values of these fields are replaced with `[MASKED]`. This does not absolve the plugin of responsibility — do not log `config.api_key` directly.
+
+## Runtime configuration updates
+
+:::info Phase 2 scope
+Subscriptions to live config-section updates (`on_section_change` / `Subscription`) are part of the Phase 2 `dagstack/config-spec` integration and are not exposed in `0.1.0-rc.2`. Today plugins receive their `config` once during `setup`; reapplying changes requires a `teardown_all()` / `setup_all(ctx)` cycle.
+:::
+
+## Testing with an ad-hoc config
+
+For unit tests pass the configuration explicitly, bypassing file-based loading:
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+    registry = PluginRegistry()
+    context = PluginContext(
+        config={"api_key": "test-key"},
+        logger=logging.getLogger("test"),
+        registry=registry,
+    )
+    plugin = StripeProvider()
+    asyncio.run(plugin.setup(context))
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { z } from "zod";
+    import type { PluginContext } from "@dagstack/plugin-system";
+
+    const ConfigSchema = z.object({
+      api_url: z.string().url(),
+      timeout_ms: z.number().int().positive().default(30_000),
+      retries: z.number().int().min(0).default(3),
+    });
+    type Config = z.infer<typeof ConfigSchema>;
+
+    export class MyPlugin {
+      private config!: Config;
+
+      async setup(ctx: PluginContext): Promise<void> {
+        this.config = ConfigSchema.parse(ctx.config);
+      }
+    }
+
+    // Host passes per-plugin config into setupAll:
+    //   await registry.setupAll({
+    //     configs: { "my-plugin": { api_url: "https://api.example.com" } },
+    //     resources,
+    //   });
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    import (
+        "context"
+        "log/slog"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    pluginCtx := &pluginsystem.PluginContext{
+        Config: map[string]any{
+            "api_key": "test-key",
+        },
+        Logger:   slog.Default(),
+        Registry: pluginsystem.NewRegistry(),
+    }
+    p := &StripeProvider{}
+    if err := p.Setup(context.Background(), pluginCtx); err != nil {
+        // handle err
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## See also
+
+- [`dagstack/config-spec`](https://github.com/dagstack/config-spec) — the full specification of hierarchical configuration, substitutions and source adapters.
+- [Plugin lifecycle](./lifecycle) — where the configuration is applied during the `setup`/`teardown` cycle.

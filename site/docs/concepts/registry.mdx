@@ -1,0 +1,279 @@
+---
+sidebar_position: 1
+title: Plugin registry
+description: PluginRegistry — the central object that holds loaded plugins, manages their lifecycle, and provides access by kind+name.
+slug: /concepts/registry
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Plugin registry
+
+`PluginRegistry` is the central object of the system. It holds the set of loaded plugins, checks that their manifests are compatible with the core version, computes the initialisation order with respect to dependencies, and exposes plugins by the **kind + name** pair.
+
+## Obtaining a registry
+
+The recommended way is to construct a `PluginRegistry` and feed it a discovery root via `registry.discover(path)`. The call walks the given directory recursively, finds folders with a `dagstack.toml`, validates the manifests, and loads the plugins into the registry.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import PluginRegistry
+
+    registry = PluginRegistry()
+    registry.discover("plugins/")
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Lookup by kind (singleton-style with priority tie-breaking):
+    const llmManifest = registry.getPlugin("llm");
+
+    // List all registered manifests:
+    for (const m of registry.list()) {
+      console.log(m.kind, m.name);
+    }
+
+    // Get LoadedPlugin[] for dispatcher fan-out:
+    const loaded = registry.getLoadedPlugins();
+
+    await registry.teardownAll();
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        return err
+    }
+
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        plugin := buildPlugin(entry.Manifest) // user-defined factory
+        if err := reg.RegisterManifest(entry.Manifest, plugin); err != nil {
+            return err
+        }
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+Direct construction (`PluginRegistry()`) is the supported entry point — `discover` is the **method** that walks the directory and validates manifests. There is no convenience function that builds the registry for you.
+
+## Lifecycle
+
+Every loaded plugin moves through three phases:
+
+1. **Registration** — `discover` reads the manifest, instantiates the plugin, and adds it to the registry. Only manifest validation and module import run at this stage.
+2. **Initialisation** — `setup_all()` computes the initialisation order via topological sort of the declared dependencies (`topo_sort`) and calls `setup(context)` on every plugin.
+3. **Teardown** — `teardown_all()` calls `teardown()` in reverse order. Errors in individual plugins do not abort the loop; they are aggregated into `TeardownErrors`.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+
+    async def main() -> None:
+        registry = PluginRegistry()
+        registry.discover("plugins/")
+
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("app"),
+            registry=registry,
+        )
+        await registry.setup_all(ctx)
+        try:
+            ...
+        finally:
+            await registry.teardown_all()
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Lookup by kind (singleton-style with priority tie-breaking):
+    const llmManifest = registry.getPlugin("llm");
+
+    // List all registered manifests:
+    for (const m of registry.list()) {
+      console.log(m.kind, m.name);
+    }
+
+    // Get LoadedPlugin[] for dispatcher fan-out:
+    const loaded = registry.getLoadedPlugins();
+
+    await registry.teardownAll();
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    ctx := context.Background()
+
+    entries, _ := pluginsystem.Discover("plugins/")
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        _ = reg.RegisterManifest(entry.Manifest, buildPlugin(entry.Manifest))
+    }
+
+    pluginCtx := &pluginsystem.PluginContext{
+        Logger:   slog.Default(),
+        Registry: reg,
+    }
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        return err
+    }
+    defer reg.TeardownAll(ctx)
+    ```
+  </TabItem>
+</Tabs>
+
+## Retrieving a plugin
+
+Access to a plugin is by the `kind + name` pair. The method returns a proxy object that applies the dispatch rules and resource injection.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    llm = registry.get_plugin("llm", name="openai_compatible")
+    response = llm.complete(prompt="Explain dagstack in one paragraph.")
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Lookup by kind (singleton-style with priority tie-breaking):
+    const llmManifest = registry.getPlugin("llm");
+
+    // List all registered manifests:
+    for (const m of registry.list()) {
+      console.log(m.kind, m.name);
+    }
+
+    // Get LoadedPlugin[] for dispatcher fan-out:
+    const loaded = registry.getLoadedPlugins();
+
+    await registry.teardownAll();
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    p, err := reg.Resolve("openai_compatible")
+    if err != nil {
+        return err
+    }
+    llm := p.Unwrap().(LLMClient)
+    resp, _ := llm.Complete(ctx, "Explain dagstack in one paragraph.")
+    ```
+  </TabItem>
+</Tabs>
+
+If the plugin is not found, `KindUnknown` (the kind is not registered) or `AmbiguousPlugin` (several plugins share the same `kind+name`) is raised.
+
+## Registry errors
+
+All errors inherit from `PluginRegistryError`:
+
+| Class | When it is raised |
+|---|---|
+| `ManifestInvalid` | The manifest does not match the schema (missing required field, wrong type). |
+| `AmbiguousPlugin` | Two plugins are registered with the same `kind+name` pair. |
+| `VersionIncompatible` | The plugin declares a `core_version` incompatible with the installed core. |
+| `KindUnknown` | The plugin kind is not registered in the registry. |
+| `RuntimeNotSupported` | The plugin supports none of the available runtimes (`in_process`, `mcp_stdio`, `mcp_http`). |
+| `DependencyCycle` | The topological sort detected a cycle in the declared inter-plugin dependencies. |
+| `TeardownErrors` | Aggregated error raised when `teardown_all()` caught exceptions in several plugins. |
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    from dagstack.plugin_system import PluginRegistry
+    from dagstack.plugin_system import ManifestInvalid, PluginRegistryError
+
+    registry = PluginRegistry()
+    try:
+        registry.discover("plugins/")
+    except ManifestInvalid as exc:
+        print(f"Invalid manifest: {exc}")
+        raise
+    except PluginRegistryError:
+        raise
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Lookup by kind (singleton-style with priority tie-breaking):
+    const llmManifest = registry.getPlugin("llm");
+
+    // List all registered manifests:
+    for (const m of registry.list()) {
+      console.log(m.kind, m.name);
+    }
+
+    // Get LoadedPlugin[] for dispatcher fan-out:
+    const loaded = registry.getLoadedPlugins();
+
+    await registry.teardownAll();
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        switch {
+        case errors.Is(err, pluginsystem.ErrManifestInvalid):
+            slog.Error("invalid manifest", "err", err)
+        case errors.Is(err, pluginsystem.ErrAmbiguousPlugin):
+            slog.Error("ambiguous plugin", "err", err)
+        case errors.Is(err, pluginsystem.ErrDependencyCycle):
+            slog.Error("dependency cycle", "err", err)
+        default:
+            slog.Error("registry error", "err", err)
+        }
+        return err
+    }
+    _ = entries
+    ```
+  </TabItem>
+</Tabs>
+
+## Invariants
+
+The registry upholds the following invariants on top of the plugin lifecycle:
+
+- **Teardown order is the reverse of setup**. If `setup_all()` initialised plugins in the order `A → B → C`, then `teardown_all()` calls `teardown` in the order `C → B → A`.
+- **Continue-on-failure during setup** (ADR-0002 §Partial-failure). If a single plugin's `setup` raises, the registry logs the failure, skips plugins that depend on it, and proceeds with the rest. Failed plugins are absent from `_setup_done`; the host can inspect them via the `setup_all` log output. `setup_all` does not propagate the first failure outwards.
+- **Stable `get_plugin` results**. The same `(kind, name)` pair always returns the same plugin instance for the lifetime of the registry.
+
+:::info Phase 2 — explicit `unavailable_plugins()`
+A direct way to list plugins that failed `setup` (and the dependents that were skipped because of them) lands in Phase 2 alongside the live config-watch integration. In `0.1.0-rc.2` the host inspects the `setup_all` logs to discover the same information.
+:::

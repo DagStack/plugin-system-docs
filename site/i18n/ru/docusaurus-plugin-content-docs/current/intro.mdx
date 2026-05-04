@@ -1,0 +1,279 @@
+---
+sidebar_position: 1
+title: Быстрый старт
+description: Установка dagstack/plugin-system и первое использование реестра плагинов на Python, TypeScript и Go.
+slug: /intro
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Быстрый старт
+
+`dagstack/plugin-system` — универсальный реестр плагинов для приложений любого домена, которым нужны подключаемые точки расширения. Типичные сценарии: источники данных, обработчики событий, notification-каналы, authentication-провайдеры, шаги пайплайна, интеграции с внешними системами. Плагины находятся в каталоге по манифестам, загружаются в реестр и вызываются через один из пяти классов диспетчеризации (singleton, broadcast-collect, broadcast-notify, chain, capability).
+
+:::info Статус публикации
+Пакеты Python и TypeScript готовятся к публикации на PyPI и npmjs.org. Пока доступны из внутреннего репозитория. Go-реализация — в дорожной карте; в примерах ниже показана планируемая сигнатура.
+:::
+
+## Установка
+
+:::warning Зрелость реализаций
+Полноценный runtime на сегодня есть только для **Python**. **TypeScript** — в разработке: опубликованы эмитируемые из спецификации константы и типы, runtime появится в следующих релизах. **Go** — в дорожной карте; примеры ниже показывают планируемую сигнатуру на основе language-agnostic спецификации (см. [ADR-0001..0006](https://github.com/dagstack/plugin-system-spec/tree/main/adr)).
+:::
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```bash
+    pip install dagstack-plugin-system
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```bash
+    npm install @dagstack/plugin-system
+    ```
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```bash
+    go get go.dagstack.dev/plugin-system
+    ```
+  </TabItem>
+</Tabs>
+
+## Первый плагин
+
+Минимальный рабочий плагин состоит из двух файлов в отдельной папке: манифеста `dagstack.toml` и модуля реализации.
+
+### Манифест плагина
+
+Манифест декларирует **вид** (`kind`), **имя**, **исполняющую среду** (`runtime`) и совместимую версию ядра.
+
+```toml title="plugins/echo/dagstack.toml"
+[plugin]
+name = "echo"
+kind = "tool"
+runtime = "in_process"
+core_version = ">=0.1.0,<1.0.0"
+```
+
+### Реализация плагина
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python title="plugins/echo/plugin.py"
+    from dagstack.plugin_system import PluginContext
+
+
+    class EchoPlugin:
+        """Returns the input message wrapped under the `echoed` key.
+
+        Mirrors the canonical `examples/echo_plugin.EchoTool` shipped
+        with the binding. Both sync and async `setup` / `teardown` are
+        accepted by the registry; the published example uses sync.
+        """
+
+        def setup(self, context: PluginContext) -> None:
+            self._ctx = context
+
+        def execute(self, args: dict) -> dict:
+            return {"echoed": args["msg"]}
+
+        def teardown(self) -> None:
+            self._ctx = None
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go title="plugins/echo/plugin.go"
+    package echo
+
+    import (
+        "context"
+
+        pluginsystem "go.dagstack.dev/plugin-system"
+    )
+
+    type EchoPlugin struct{}
+
+    func (p *EchoPlugin) Unwrap() any { return p }
+
+    func (p *EchoPlugin) Setup(ctx context.Context, pluginCtx *pluginsystem.PluginContext) error {
+        return nil
+    }
+
+    func (p *EchoPlugin) Invoke(payload string) (string, error) {
+        return payload, nil
+    }
+
+    func (p *EchoPlugin) Teardown(ctx context.Context) error {
+        return nil
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Обнаружение и загрузка реестра
+
+Функция `discover(path)` рекурсивно сканирует каталог, находит все папки с `dagstack.toml`, валидирует манифесты и возвращает реестр с загруженными плагинами. Метод `setup_all()` выполняет инициализацию каждого плагина с учётом зависимостей между ними (топологическая сортировка).
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    import asyncio
+    import logging
+    from dagstack.plugin_system import PluginContext, PluginRegistry
+
+
+    async def main() -> None:
+        registry = PluginRegistry()
+        registry.discover("plugins/")
+
+        ctx = PluginContext(
+            config={},
+            logger=logging.getLogger("app"),
+            registry=registry,
+        )
+        await registry.setup_all(ctx)
+
+        for manifest in registry.list_manifests():
+            print(manifest.kind, manifest.name)
+
+        await registry.teardown_all()
+
+
+    asyncio.run(main())
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    ctx := context.Background()
+
+    entries, err := pluginsystem.Discover("plugins/")
+    if err != nil {
+        panic(err)
+    }
+
+    reg := pluginsystem.NewRegistry()
+    for _, entry := range entries {
+        plugin := buildPlugin(entry.Manifest) // user-defined factory
+        if err := reg.RegisterManifest(entry.Manifest, plugin); err != nil {
+            panic(err)
+        }
+    }
+
+    pluginCtx := &pluginsystem.PluginContext{
+        Logger:   slog.Default(),
+        Registry: reg,
+    }
+    if err := reg.SetupAll(ctx, pluginCtx); err != nil {
+        panic(err)
+    }
+    defer reg.TeardownAll(ctx)
+
+    for _, m := range reg.ListManifests() {
+        fmt.Println(m.Kind, m.Name)
+    }
+    ```
+  </TabItem>
+</Tabs>
+
+## Вызов плагина
+
+Плагины получают через реестр по сочетанию `kind + name`. Возвращённый объект — это прокси, который применяет правила диспетчеризации, инъекцию ресурсов и проверки контракта.
+
+<Tabs groupId="lang" queryString="lang">
+  <TabItem value="python" label="Python">
+    ```python
+    echo = registry.get_plugin("tool", name="echo")
+    result = echo.execute({"msg": "hello"})
+    assert result == {"echoed": "hello"}
+    ```
+  </TabItem>
+  <TabItem value="typescript" label="TypeScript">
+    ```ts
+    import { PluginRegistry, discover, SingletonDispatcher } from "@dagstack/plugin-system";
+
+    const registry = new PluginRegistry();
+    await discover(registry, "plugins/");
+    await registry.setupAll();
+
+    // Используйте registry.getLoadedPlugins() с любым из пяти диспетчеров
+    // (singleton / broadcast_collect / broadcast_notify / chain / capability) —
+    // см. [руководства по диспетчерам](/ru/docs/guides/dispatchers/singleton).
+
+    await registry.teardownAll();
+    ```
+
+    Полные snippet'ы под конкретные API — на соответствующих EN-страницах концептов, гайдов и спецификации.
+  </TabItem>
+  <TabItem value="go" label="Go">
+    ```go
+    p, err := reg.Resolve("echo")
+    if err != nil {
+        panic(err)
+    }
+    echo := p.Unwrap().(*echo.EchoPlugin)
+    result, _ := echo.Invoke("hello")
+    fmt.Println(result) // hello
+    ```
+  </TabItem>
+</Tabs>
+
+## Что дальше
+
+**Понятия** — как устроены основные компоненты:
+
+- [Реестр плагинов](./concepts/registry), [Манифест](./concepts/manifest), [Обнаружение](./concepts/discovery) — базовые объекты.
+- [Виды плагинов](./concepts/kinds), [Исполняющие среды](./concepts/runtimes), [Диспетчеризация](./concepts/dispatch) — архитектурные концепты.
+- [Ресурсы (Resources DI)](./concepts/resources), [Runtime-инварианты](./concepts/invariants) — поведение в разных средах.
+
+**Руководства** — как решать типовые задачи:
+
+- [Как написать плагин](./guides/writing-a-plugin), [Конфигурация](./guides/configuration), [Жизненный цикл](./guides/lifecycle).
+- [Тестирование плагинов](./guides/testing), [Зависимости](./guides/dependencies), [Классы диспетчеризации](./guides/dispatchers/singleton).
+
+**Справочник** — точные таблицы для быстрого поиска:
+
+- [Схема `dagstack.toml`](./reference/manifest-schema), [Встроенные виды](./reference/kinds-list), [Runtime-адаптеры](./reference/runtimes-list).
+- [Стандартные ресурсы](./reference/resources-list), [Таксономия ошибок](./reference/errors).
+
+**Спецификация** — нормативные архитектурные решения:
+
+- [Обзор](./spec/overview), [ADR-0001: Архитектура ядра](./spec/adr/0001-core), [ADR-0002: Диспетчеризация](./spec/adr/0002-hook-invocation) и остальные.
+
+**Справочник API** (генерация отложена до выхода реализаций в stable):
+
+- [Python](./api/python), [TypeScript](./api/typescript) (roadmap), [Go](./api/go) (roadmap).
